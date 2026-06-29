@@ -1,0 +1,893 @@
+"""連続スクロール対応のページ表示ウィジェット。
+
+全ページを縦に並べて表示し、ビューポートに見えている（近い）ページだけを
+遅延描画する。遠いページの QPixmap は解放してメモリ使用を抑える。
+"""
+from __future__ import annotations
+
+from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen
+from PySide6.QtWidgets import (
+    QGridLayout,
+    QLabel,
+    QLayout,
+    QMenu,
+    QScrollArea,
+    QWidget,
+)
+
+from .document import PdfDocument
+
+PAGE_SPACING = 12  # ページ間の余白(px)
+
+# 注釈ツール
+TOOL_NONE = "none"
+TOOL_HIGHLIGHT = "highlight"
+TOOL_RECT = "rect"
+TOOL_PEN = "pen"
+TOOL_TEXT = "text"
+TOOL_NOTE = "note"
+TOOL_ERASE = "erase"
+TOOL_UNDERLINE = "underline"
+TOOL_STRIKEOUT = "strikeout"
+TOOL_LINE = "line"
+TOOL_ARROW = "arrow"
+TOOL_CIRCLE = "circle"
+TOOL_REDACT = "redact"
+TOOL_CROP = "crop"
+
+# ドラッグ矩形系（始点・終点で矩形を作る）
+_RECT_TOOLS = {TOOL_HIGHLIGHT, TOOL_RECT, TOOL_TEXT, TOOL_CIRCLE, TOOL_REDACT, TOOL_CROP}
+# 始点→終点の線/テキストマーク系
+_LINE_TOOLS = {TOOL_LINE, TOOL_ARROW, TOOL_UNDERLINE, TOOL_STRIKEOUT}
+
+HANDLE_DRAW = 9   # ハンドルの描画サイズ(px)
+HANDLE_HIT = 8    # ハンドルの当たり判定半径(px)
+
+
+def _handle_centers(box):
+    """選択枠 (x0,y0,x1,y1) の8ハンドル中心。0-3=四隅, 4-7=各辺中点。"""
+    x0, y0, x1, y1 = box
+    mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+    return {0: (x0, y0), 1: (x1, y0), 2: (x1, y1), 3: (x0, y1),
+            4: (mx, y0), 5: (x1, my), 6: (mx, y1), 7: (x0, my)}
+
+
+def _resize_box(box, handle, dx, dy):
+    """ハンドルに応じて枠を変形（最小サイズ確保・正規化）。"""
+    x0, y0, x1, y1 = box
+    if handle in (0, 3, 7):
+        x0 += dx
+    if handle in (1, 2, 5):
+        x1 += dx
+    if handle in (0, 1, 4):
+        y0 += dy
+    if handle in (2, 3, 6):
+        y1 += dy
+    nx0, nx1 = sorted((x0, x1))
+    ny0, ny1 = sorted((y0, y1))
+    if nx1 - nx0 < 6:
+        nx1 = nx0 + 6
+    if ny1 - ny0 < 6:
+        ny1 = ny0 + 6
+    return (nx0, ny0, nx1, ny1)
+
+
+class _PageLabel(QLabel):
+    """1 ページ分の表示ラベル。注釈ツール使用時はマウス描画を処理する。"""
+
+    def __init__(self, index: int, view: "PageView") -> None:
+        super().__init__()
+        self._index = index
+        self._view = view
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("background:#e6e6e6; border:1px solid #b0b0b0;")
+        self.setCursor(Qt.CursorShape.IBeamCursor)  # 既定(選択ツール)=テキスト選択
+        self._drawing = False
+        self._start = QPoint()
+        self._cur = QPoint()
+        self._stroke: list[QPoint] = []  # ペン用
+        self._sel_moving = False
+        self._move_offset = QPoint()
+        self._text_selecting = False
+        self._resizing = False
+        self._resize_handle = None
+        self._box_start = None
+        self._cur_box = None
+        self._press = QPoint()
+
+    # --- マウス ---------------------------------------------------------
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        tool = self._view.tool
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        pos = event.position().toPoint()
+        if tool == TOOL_NONE:
+            # 選択中なら、まずリサイズハンドルの上か判定
+            box = self._view.selection_box_label(self._index)
+            if box is not None:
+                handle = self._handle_at(pos, box)
+                if handle is not None:
+                    self._resizing = True
+                    self._resize_handle = handle
+                    self._box_start = box
+                    self._cur_box = box
+                    self._press = pos
+                    return
+            # 注釈に当たれば選択して移動、外れたらテキスト選択を開始
+            xref = self._view.hit_annot(self._index, pos)
+            if xref is not None:
+                self._view.set_selection(self._index, xref)
+                self._sel_moving = True
+                self._start = pos
+                self._move_offset = QPoint()
+            else:
+                self._view.clear_selection()
+                self._text_selecting = True
+                self._start = pos
+                self._view.clear_text_selection()
+            return
+        if tool in (TOOL_NOTE, TOOL_ERASE):
+            self._view.commit_point(self._index, tool, pos)
+            return
+        self._drawing = True
+        self._start = pos
+        self._cur = pos
+        self._stroke = [pos]
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._text_selecting:
+            self._view.update_text_selection(
+                self._index, self._start, event.position().toPoint()
+            )
+            return
+        if self._resizing:
+            d = event.position().toPoint() - self._press
+            self._cur_box = _resize_box(self._box_start, self._resize_handle, d.x(), d.y())
+            self.update()
+            return
+        if self._sel_moving:
+            self._move_offset = event.position().toPoint() - self._start
+            self.update()
+            return
+        if not self._drawing:
+            return
+        self._cur = event.position().toPoint()
+        if self._view.tool == TOOL_PEN:
+            self._stroke.append(self._cur)
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._text_selecting:
+            self._text_selecting = False
+            return
+        if self._resizing:
+            self._resizing = False
+            box = self._cur_box
+            self._cur_box = None
+            self._box_start = None
+            self._resize_handle = None
+            if box is not None:
+                self._view.resize_selection(self._index, box)
+            self.update()
+            return
+        if self._sel_moving:
+            self._sel_moving = False
+            end = event.position().toPoint()
+            if (end - self._start).manhattanLength() > 3:
+                self._view.move_selection(self._index, self._start, end)
+            self._move_offset = QPoint()
+            self.update()
+            return
+        if not self._drawing:
+            return
+        self._drawing = False
+        tool = self._view.tool
+        if tool == TOOL_PEN:
+            self._view.commit_stroke(self._index, list(self._stroke))
+        else:
+            self._view.commit_drag(self._index, self._start, self._cur, tool)
+        self._stroke = []
+        self.update()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        if self._view.tool == TOOL_NONE and self._view.has_text_selection():
+            menu = QMenu(self)
+            act = menu.addAction("コピー")
+            if menu.exec(event.globalPos()) == act:
+                self._view.copy_selection()
+            return
+        super().contextMenuEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        if self._view.tool == TOOL_NONE and event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            xref = self._view.hit_annot(self._index, pos)
+            if xref is not None:
+                self._view.set_selection(self._index, xref)
+                self._view.edit_selection_text()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def _handle_at(self, pos, box):
+        for hid, (hx, hy) in _handle_centers(box).items():
+            if abs(pos.x() - hx) <= HANDLE_HIT and abs(pos.y() - hy) <= HANDLE_HIT:
+                return hid
+        return None
+
+    # --- 描画中プレビュー -----------------------------------------------
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        # テキスト選択の塗り
+        tboxes = self._view.text_sel_boxes_label(self._index)
+        if tboxes:
+            tp = QPainter(self)
+            sel = QColor(51, 153, 255, 90)
+            for (x0, y0, x1, y1) in tboxes:
+                tp.fillRect(QRect(int(x0), int(y0), int(x1 - x0), int(y1 - y0)), sel)
+            tp.end()
+        # 検索ヒットのハイライト
+        boxes = self._view.search_boxes_label(self._index)
+        if boxes:
+            hp = QPainter(self)
+            for (x0, y0, x1, y1), is_cur in boxes:
+                rect = QRect(int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+                if is_cur:
+                    hp.fillRect(rect, QColor(255, 140, 0, 110))
+                    hp.setPen(QPen(QColor(230, 100, 0), 2))
+                    hp.drawRect(rect)
+                else:
+                    hp.fillRect(rect, QColor(255, 235, 0, 90))
+            hp.end()
+        # 選択中の注釈の枠（移動/リサイズプレビュー・ハンドル）
+        if not self._drawing:
+            if self._resizing and self._cur_box is not None:
+                box = self._cur_box
+            else:
+                b = self._view.selection_box_label(self._index)
+                if b is None:
+                    return
+                ox, oy = self._move_offset.x(), self._move_offset.y()
+                box = (b[0] + ox, b[1] + oy, b[2] + ox, b[3] + oy)
+            x0, y0, x1, y1 = box
+            rect = QRect(int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+            sp = QPainter(self)
+            sp.setPen(QPen(QColor(26, 115, 232), 2, Qt.PenStyle.DashLine))
+            sp.drawRect(rect)
+            sp.fillRect(rect, QColor(26, 115, 232, 30))
+            # リサイズハンドル（白地に青枠の四角）
+            sp.setPen(QPen(QColor(26, 115, 232), 1, Qt.PenStyle.SolidLine))
+            for hx, hy in _handle_centers(box).values():
+                hr = QRect(int(hx - HANDLE_DRAW / 2), int(hy - HANDLE_DRAW / 2),
+                           HANDLE_DRAW, HANDLE_DRAW)
+                sp.fillRect(hr, QColor(255, 255, 255))
+                sp.drawRect(hr)
+            sp.end()
+            return
+        painter = QPainter(self)
+        color = self._view.color
+        tool = self._view.tool
+        rect = QRect(self._start, self._cur).normalized()
+        if tool in (TOOL_HIGHLIGHT, TOOL_UNDERLINE, TOOL_STRIKEOUT):
+            fill = QColor(color)
+            fill.setAlpha(70)
+            painter.fillRect(rect, fill)
+        elif tool == TOOL_PEN:
+            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width), Qt.PenStyle.SolidLine,
+                                Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            for i in range(1, len(self._stroke)):
+                painter.drawLine(self._stroke[i - 1], self._stroke[i])
+        elif tool in (TOOL_LINE, TOOL_ARROW):
+            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width)))
+            painter.drawLine(self._start, self._cur)
+        elif tool == TOOL_CIRCLE:
+            painter.setPen(QPen(QColor(color), max(1, self._view.pen_width)))
+            painter.drawEllipse(rect)
+        elif tool == TOOL_REDACT:
+            painter.fillRect(rect, QColor(0, 0, 0, 160))
+        else:  # rect / text の枠プレビュー
+            painter.setPen(QPen(QColor(color), 1, Qt.PenStyle.DashLine))
+            painter.drawRect(rect)
+        painter.end()
+
+
+class PageView(QScrollArea):
+    """縦スクロールで全ページを連続表示する。"""
+
+    page_changed = Signal(int)        # 表示中（中央付近）のページが変わった
+    annotation_changed = Signal(int)  # 注釈を追加/削除したページ
+    selection_changed = Signal(bool)       # 注釈の選択有無が変わった
+    text_selection_changed = Signal(bool)  # テキスト選択の有無が変わった
+    zoom_changed = Signal(float)           # ズーム倍率が変わった
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._container = QWidget()
+        # グリッド配置（1列=通常、2列=見開き）。ラベルはコンテナ直下なので
+        # label.y() はコンテナ基準のままで、遅延描画ロジックがそのまま使える。
+        self._layout = QGridLayout(self._container)
+        self._layout.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self._layout.setSpacing(PAGE_SPACING)
+        self._layout.setContentsMargins(PAGE_SPACING, PAGE_SPACING, PAGE_SPACING, PAGE_SPACING)
+        self._layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+        self.setWidget(self._container)
+        self.setWidgetResizable(False)
+        self.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.setBackgroundRole(self.backgroundRole())
+
+        self._doc: PdfDocument | None = None
+        self._labels: list[QLabel] = []
+        self._rendered: set[int] = set()
+        self._index: int = 0
+        self._zoom: float = 1.0
+        self._cols = 1  # 1=通常 / 2=見開き
+        self._suspend_scroll = False
+
+        # 注釈ツールの状態
+        self.tool = TOOL_NONE
+        self.color = QColor(255, 219, 46)   # 既定はハイライト用の黄
+        self.pen_width = 2
+        self._sel_index = -1
+        self._sel_xref = None
+        # 検索
+        self._search_hits: list = []   # [(page_index, fitz.Rect)]
+        self._search_cur = -1
+        # テキスト選択
+        self._text_sel_index = -1
+        self._text_sel_rects: list = []   # PDF座標の矩形
+        self._text_sel_text = ""
+
+        # 中クリックによるオートスクロール（ブラウザ風）
+        self._auto_active = False
+        self._auto_origin = QPoint()
+        self._auto_pos = QPoint()
+        self._auto_moved = False
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(16)  # 約60fps
+        self._auto_timer.timeout.connect(self._auto_scroll_tick)
+        self.viewport().installEventFilter(self)
+
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+
+    # --- 公開 API -------------------------------------------------------
+    def set_document(self, doc: PdfDocument) -> None:
+        self._doc = doc
+        self._index = 0
+        self._zoom = 1.0
+        self._rebuild(fit=True, target=0)
+
+    def reload(self, target: int = 0) -> None:
+        """ページ構成が変わった後（削除・並べ替え・統合）に再構築する。
+
+        現在のズーム倍率は維持し、target ページへスクロールする。
+        """
+        if self._doc and self._doc.is_open:
+            target = max(0, min(target, self._doc.page_count - 1))
+        self._rebuild(fit=False, target=target)
+
+    @property
+    def index(self) -> int:
+        return self._index
+
+    @property
+    def zoom(self) -> float:
+        return self._zoom
+
+    def set_canvas_color(self, color: str) -> None:
+        """ページ周辺(余白)の背景色をテーマに合わせる。"""
+        self.viewport().setStyleSheet(f"background: {color};")
+
+    # --- 注釈ツール -----------------------------------------------------
+    def set_tool(self, tool: str) -> None:
+        self.tool = tool
+        if tool != TOOL_NONE:
+            self.clear_selection()       # 描画ツール中は注釈選択を解除
+            self.clear_text_selection()  # テキスト選択も解除
+        # ツール使用時は手のひらカーソル等にして分かりやすく
+        if tool == TOOL_NONE:
+            self.viewport().unsetCursor()
+        cursor = {
+            TOOL_ERASE: Qt.CursorShape.PointingHandCursor,
+            # 選択モードはテキスト選択ができることを示す I ビームカーソル
+            TOOL_NONE: Qt.CursorShape.IBeamCursor,
+        }.get(tool, Qt.CursorShape.CrossCursor)
+        for lbl in self._labels:
+            lbl.setCursor(cursor)
+
+    def set_color(self, qcolor: QColor) -> None:
+        self.color = qcolor
+
+    def set_pen_width(self, width: int) -> None:
+        self.pen_width = max(1, int(width))
+
+    def _rgb(self) -> tuple:
+        c = self.color
+        return (c.redF(), c.greenF(), c.blueF())
+
+    def commit_drag(self, index: int, p0: QPoint, p1: QPoint, tool: str) -> None:
+        if not self._doc:
+            return
+        a = self._doc.label_to_pdf_point(index, p0.x(), p0.y(), self._zoom)
+        b = self._doc.label_to_pdf_point(index, p1.x(), p1.y(), self._zoom)
+
+        # 線・矢印・下線・取消線は始点→終点で扱う
+        if tool in (TOOL_LINE, TOOL_ARROW):
+            if (p1 - p0).manhattanLength() < 3:
+                return
+            self._doc.add_line(index, a, b, color=self._rgb(),
+                               width=self.pen_width, arrow=(tool == TOOL_ARROW))
+            self._after_annot(index)
+            return
+        if tool == TOOL_UNDERLINE:
+            self._doc.add_underline(index, a, b, color=self._rgb())
+            self._after_annot(index)
+            return
+        if tool == TOOL_STRIKEOUT:
+            self._doc.add_strikeout(index, a, b, color=self._rgb())
+            self._after_annot(index)
+            return
+
+        rect = self._doc.label_to_pdf_rect(
+            index, p0.x(), p0.y(), p1.x(), p1.y(), self._zoom
+        )
+        if rect.width < 2 or rect.height < 2:
+            return  # 誤クリックの極小矩形は無視
+        if tool == TOOL_HIGHLIGHT:
+            if not self._doc.add_text_highlight(index, a, b, color=self._rgb()):
+                self._doc.add_highlight(index, rect, color=self._rgb())
+        elif tool == TOOL_RECT:
+            self._doc.add_rect(index, rect, color=self._rgb(), width=self.pen_width)
+        elif tool == TOOL_CIRCLE:
+            self._doc.add_circle(index, rect, color=self._rgb(), width=self.pen_width)
+        elif tool == TOOL_REDACT:
+            self._doc.add_redaction(index, rect)
+        elif tool == TOOL_CROP:
+            self._doc.set_crop(index, rect)
+            self.reload(index)  # ページサイズが変わるので再構築
+            return
+        elif tool == TOOL_TEXT:
+            from PySide6.QtWidgets import QInputDialog
+            text, ok = QInputDialog.getMultiLineText(self, "テキスト注釈", "本文:")
+            if not ok or not text.strip():
+                return
+            self._doc.add_freetext(index, rect, text, color=self._rgb())
+        self._after_annot(index)
+
+    def commit_stroke(self, index: int, points: list) -> None:
+        if not self._doc or len(points) < 2:
+            return
+        stroke = [self._doc.label_to_pdf_point(index, p.x(), p.y(), self._zoom)
+                  for p in points]
+        self._doc.add_ink(index, [stroke], color=self._rgb(), width=self.pen_width)
+        self._after_annot(index)
+
+    def commit_point(self, index: int, tool: str, p: QPoint) -> None:
+        if not self._doc:
+            return
+        pt = self._doc.label_to_pdf_point(index, p.x(), p.y(), self._zoom)
+        if tool == TOOL_NOTE:
+            from PySide6.QtWidgets import QInputDialog
+            text, ok = QInputDialog.getMultiLineText(self, "付箋メモ", "本文:")
+            if not ok or not text.strip():
+                return
+            self._doc.add_text_note(index, pt, text)
+            self._after_annot(index)
+        elif tool == TOOL_ERASE:
+            if self._doc.delete_annot_at(index, pt):
+                self._after_annot(index)
+
+    def _after_annot(self, index: int) -> None:
+        self._rendered.discard(index)
+        self._render_visible()
+        self.annotation_changed.emit(index)
+
+    def apply_redactions(self) -> None:
+        """登録済みの墨消しを全ページに適用し、全ページを再描画する。"""
+        if not self._doc:
+            return
+        self._doc.apply_redactions()
+        self.reload(self._index)
+        self.annotation_changed.emit(self._index)
+
+    # --- 検索 -----------------------------------------------------------
+    def set_search_results(self, hits: list) -> None:
+        self._search_hits = hits
+        self._search_cur = 0 if hits else -1
+        self._repaint_labels()
+        if hits:
+            self.goto_hit(0)
+
+    def clear_search(self) -> None:
+        self._search_hits = []
+        self._search_cur = -1
+        self._repaint_labels()
+
+    def search_count(self) -> int:
+        return len(self._search_hits)
+
+    def search_current(self) -> int:
+        return self._search_cur
+
+    def goto_hit(self, i: int) -> None:
+        if not self._search_hits:
+            return
+        i %= len(self._search_hits)
+        self._search_cur = i
+        page_index, rect = self._search_hits[i]
+        self.set_page(page_index)  # まずページ先頭へ
+        # ヒット位置が見えるよう微調整スクロール
+        label = self._labels[page_index]
+        box = self._doc.pdf_rect_to_label(page_index, rect, self._zoom)
+        self._suspend_scroll = True
+        self.verticalScrollBar().setValue(int(label.y() + box[1]) - 80)
+        self._suspend_scroll = False
+        self._render_visible()
+        self._repaint_labels()
+
+    def search_boxes_label(self, index: int) -> list:
+        """index ページ上の検索ヒット枠 [(box, is_current), ...]。"""
+        if not self._search_hits or not self._doc:
+            return []
+        out = []
+        for j, (pi, rect) in enumerate(self._search_hits):
+            if pi == index:
+                out.append((self._doc.pdf_rect_to_label(index, rect, self._zoom),
+                            j == self._search_cur))
+        return out
+
+    def _repaint_labels(self) -> None:
+        for lbl in self._labels:
+            lbl.update()
+
+    # --- テキスト選択 / コピー ----------------------------------------
+    def update_text_selection(self, index: int, p0: QPoint, p1: QPoint) -> None:
+        if not self._doc:
+            return
+        a = self._doc.label_to_pdf_point(index, p0.x(), p0.y(), self._zoom)
+        b = self._doc.label_to_pdf_point(index, p1.x(), p1.y(), self._zoom)
+        text, rects = self._doc.select_text(index, a, b)
+        prev_index = self._text_sel_index
+        had = bool(self._text_sel_text)
+        self._text_sel_index = index
+        self._text_sel_rects = rects
+        self._text_sel_text = text
+        if 0 <= prev_index < len(self._labels) and prev_index != index:
+            self._labels[prev_index].update()
+        if 0 <= index < len(self._labels):
+            self._labels[index].update()
+        if bool(text) != had:
+            self.text_selection_changed.emit(bool(text))
+
+    def clear_text_selection(self) -> None:
+        idx = self._text_sel_index
+        had = bool(self._text_sel_text)
+        self._text_sel_index = -1
+        self._text_sel_rects = []
+        self._text_sel_text = ""
+        if 0 <= idx < len(self._labels):
+            self._labels[idx].update()
+        if had:
+            self.text_selection_changed.emit(False)
+
+    def has_text_selection(self) -> bool:
+        return bool(self._text_sel_text)
+
+    def selection_text(self) -> str:
+        return self._text_sel_text
+
+    def copy_selection(self) -> bool:
+        if not self._text_sel_text:
+            return False
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self._text_sel_text)
+        return True
+
+    def text_sel_boxes_label(self, index: int) -> list:
+        if index != self._text_sel_index or not self._doc:
+            return []
+        return [self._doc.pdf_rect_to_label(index, r, self._zoom)
+                for r in self._text_sel_rects]
+
+    # --- 注釈の選択・移動・編集 ---------------------------------------
+    def hit_annot(self, index: int, pos: QPoint):
+        if not self._doc:
+            return None
+        pt = self._doc.label_to_pdf_point(index, pos.x(), pos.y(), self._zoom)
+        return self._doc.annot_at(index, pt)
+
+    def set_selection(self, index: int, xref) -> None:
+        prev = self._sel_index
+        self._sel_index = index
+        self._sel_xref = xref
+        if 0 <= prev < len(self._labels) and prev != index:
+            self._labels[prev].update()
+        if 0 <= index < len(self._labels):
+            self._labels[index].update()
+        self.selection_changed.emit(self.has_selection())
+
+    def clear_selection(self) -> None:
+        idx = self._sel_index
+        self._sel_index = -1
+        self._sel_xref = None
+        if 0 <= idx < len(self._labels):
+            self._labels[idx].update()
+        self.selection_changed.emit(False)
+
+    def has_selection(self) -> bool:
+        return self._sel_xref is not None
+
+    def selection_box_label(self, index: int):
+        """index ページが選択中なら、注釈枠のラベル座標 (x0,y0,x1,y1) を返す。"""
+        if index != self._sel_index or self._sel_xref is None or not self._doc:
+            return None
+        rect = self._doc.annot_rect(index, self._sel_xref)
+        if rect is None:
+            return None
+        return self._doc.pdf_rect_to_label(index, rect, self._zoom)
+
+    def move_selection(self, index: int, p0: QPoint, p1: QPoint) -> None:
+        if self._sel_xref is None or not self._doc:
+            return
+        a = self._doc.label_to_pdf_point(index, p0.x(), p0.y(), self._zoom)
+        b = self._doc.label_to_pdf_point(index, p1.x(), p1.y(), self._zoom)
+        new_xref = self._doc.move_annot(index, self._sel_xref, b.x - a.x, b.y - a.y)
+        if new_xref is not None:
+            self._sel_xref = new_xref
+        self._after_annot(index)
+
+    def resize_selection(self, index: int, box_label) -> None:
+        if self._sel_xref is None or not self._doc:
+            return
+        x0, y0, x1, y1 = box_label
+        new_rect = self._doc.label_to_pdf_rect(index, x0, y0, x1, y1, self._zoom)
+        new_xref = self._doc.resize_annot(index, self._sel_xref, new_rect)
+        if new_xref is not None:
+            self._sel_xref = new_xref
+        self._after_annot(index)
+
+    def recolor_selection(self, qcolor: QColor) -> None:
+        if self._sel_xref is None or not self._doc:
+            return
+        col = (qcolor.redF(), qcolor.greenF(), qcolor.blueF())
+        new_xref = self._doc.recolor_annot(self._sel_index, self._sel_xref, col)
+        if new_xref is not None:
+            self._sel_xref = new_xref
+        self._after_annot(self._sel_index)
+
+    def delete_selection(self) -> None:
+        if self._sel_xref is None or not self._doc:
+            return
+        index = self._sel_index
+        xref = self._sel_xref
+        self.clear_selection()
+        self._doc.delete_annot_xref(index, xref)
+        self._after_annot(index)
+
+    def edit_selection_text(self) -> None:
+        if self._sel_xref is None or not self._doc:
+            return
+        index = self._sel_index
+        if not self._doc.annot_is_textual(index, self._sel_xref):
+            return
+        from PySide6.QtWidgets import QInputDialog
+        current = self._doc.annot_text(index, self._sel_xref)
+        text, ok = QInputDialog.getMultiLineText(self, "注釈の編集", "本文:", current)
+        if not ok:
+            return
+        new_xref = self._doc.set_annot_text(index, self._sel_xref, text)
+        if new_xref is not None:
+            self._sel_xref = new_xref
+        self._after_annot(index)
+
+    def set_page(self, index: int) -> None:
+        """指定ページの先頭までスクロールする。"""
+        if not self._doc or not self._doc.is_open:
+            return
+        index = max(0, min(index, self._doc.page_count - 1))
+        label = self._labels[index]
+        self._suspend_scroll = True
+        self.verticalScrollBar().setValue(label.y() - PAGE_SPACING)
+        self._suspend_scroll = False
+        self._set_index(index)
+        self._render_visible()
+
+    def set_zoom(self, zoom: float) -> None:
+        zoom = max(0.1, min(zoom, 8.0))
+        if not self._doc or not self._doc.is_open:
+            self._zoom = zoom
+            return
+        anchor = self._index  # ズーム後も同じページを画面に保つ
+        self._zoom = zoom
+        self._resize_all()
+        self.set_page(anchor)
+        self.zoom_changed.emit(self._zoom)
+
+    def fit_width(self) -> None:
+        if not self._doc or not self._doc.is_open:
+            return
+        w, _ = self._doc.page_pixel_size(self._index, zoom=1.0)
+        if w:
+            # 見開き時は横に self._cols ページ＋ページ間余白が並ぶ
+            margin = PAGE_SPACING * (self._cols + 2) + 8
+            avail = self.viewport().width() - margin
+            self.set_zoom(avail / (w * self._cols))
+
+    def refresh_page(self, index: int) -> None:
+        """1 ページを再描画（回転後などサイズが変わる場合に対応）。"""
+        if not self._doc or not (0 <= index < len(self._labels)):
+            return
+        self._apply_placeholder_size(index)
+        self._rendered.discard(index)
+        self._render_visible()
+
+    def render(self) -> None:
+        """表示中ページ周辺を再描画する。"""
+        self._render_visible()
+
+    # --- 構築・レイアウト ----------------------------------------------
+    def _rebuild(self, fit: bool, target: int) -> None:
+        # 既存ラベルを破棄
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._labels.clear()
+        self._rendered.clear()
+
+        if not self._doc or not self._doc.is_open:
+            self._relayout_container()
+            return
+
+        for i in range(self._doc.page_count):
+            label = _PageLabel(i, self)
+            self._labels.append(label)
+            self._layout.addWidget(label, i // self._cols, i % self._cols)
+        self._index = 0
+        self._resize_all()
+        if fit:
+            self.fit_width()
+        self.set_page(target)
+
+    def set_facing(self, on: bool) -> None:
+        """見開き表示(2列)のオン/オフ。"""
+        cols = 2 if on else 1
+        if cols == self._cols:
+            return
+        self._cols = cols
+        if self._doc and self._doc.is_open:
+            self.reload(self._index)
+
+    def _resize_all(self) -> None:
+        for i in range(len(self._labels)):
+            self._apply_placeholder_size(i)
+        self._rendered.clear()
+        self._relayout_container()
+
+    def _relayout_container(self) -> None:
+        """レイアウトを確定させる。
+
+        コンテナ寸法はレイアウトの SetFixedSize 制約が自動で追従させるため、
+        ここでは activate でジオメトリを即時確定するだけでよい。
+        """
+        self._layout.activate()
+
+    def _apply_placeholder_size(self, index: int) -> None:
+        w, h = self._doc.page_pixel_size(index, self._zoom)
+        self._labels[index].setFixedSize(w, h)
+
+    # --- 中クリック オートスクロール -----------------------------------
+    AUTO_DEADZONE = 18  # この距離以内は動かさない(px)
+    AUTO_DIVISOR = 8     # 大きいほどゆっくり
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt 命名)
+        if obj is self.viewport():
+            et = event.type()
+            if et == QEvent.Type.MouseButtonPress:
+                if self._auto_active:
+                    # オートスクロール中はどのボタンでも停止（ブラウザと同様）
+                    self._stop_autoscroll()
+                    return True
+                if event.button() == Qt.MouseButton.MiddleButton:
+                    self._start_autoscroll(event.position().toPoint())
+                    return True
+            elif et == QEvent.Type.MouseMove and self._auto_active:
+                self._auto_pos = event.position().toPoint()
+                if (self._auto_pos - self._auto_origin).manhattanLength() > 10:
+                    self._auto_moved = True
+                return True
+            elif et == QEvent.Type.MouseButtonRelease and self._auto_active:
+                # 押したまま動かした場合は離して停止（クリックだけなら継続）
+                if event.button() == Qt.MouseButton.MiddleButton and self._auto_moved:
+                    self._stop_autoscroll()
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _start_autoscroll(self, pos: QPoint) -> None:
+        self._auto_active = True
+        self._auto_origin = pos
+        self._auto_pos = pos
+        self._auto_moved = False
+        self.viewport().setMouseTracking(True)
+        self.viewport().setCursor(Qt.CursorShape.SizeVerCursor)
+        self._auto_timer.start()
+
+    def _stop_autoscroll(self) -> None:
+        self._auto_active = False
+        self._auto_timer.stop()
+        self.viewport().setMouseTracking(False)
+        self.viewport().unsetCursor()
+
+    def _auto_scroll_tick(self) -> None:
+        dy = self._auto_pos.y() - self._auto_origin.y()
+        if abs(dy) <= self.AUTO_DEADZONE:
+            return
+        # デッドゾーンを越えた分だけ、距離に比例した速度でスクロール
+        offset = dy - self.AUTO_DEADZONE if dy > 0 else dy + self.AUTO_DEADZONE
+        step = int(offset / self.AUTO_DIVISOR)
+        if step:
+            bar = self.verticalScrollBar()
+            bar.setValue(bar.value() + step)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        if event.matches(QKeySequence.StandardKey.Copy) and self.has_text_selection():
+            self.copy_selection()
+            return
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.has_selection():
+            self.delete_selection()
+            return
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        super().resizeEvent(event)
+        self._render_visible()
+
+    # --- 遅延描画 -------------------------------------------------------
+    def _on_scroll(self, _value: int) -> None:
+        if self._suspend_scroll:
+            return
+        self._render_visible()
+        self._update_current_page()
+
+    def _visible_range(self) -> tuple[int, int]:
+        """描画対象とするビューポート上下端(コンテナ座標)。前後に1画面分の余白。"""
+        top = self.verticalScrollBar().value()
+        h = self.viewport().height()
+        return (top - h, top + 2 * h)
+
+    def _render_visible(self) -> None:
+        if not self._doc or not self._doc.is_open:
+            return
+        lo, hi = self._visible_range()
+        page_count = self._doc.page_count
+        for i, label in enumerate(self._labels):
+            if i >= page_count:
+                # リロード中の保留イベントなどでラベルが一時的に多い場合の保険
+                continue
+            y0 = label.y()
+            y1 = y0 + label.height()
+            visible = y1 >= lo and y0 <= hi
+            if visible and i not in self._rendered:
+                pixmap = self._doc.render_page(i, zoom=self._zoom)
+                label.setPixmap(pixmap)
+                self._rendered.add(i)
+            elif not visible and i in self._rendered:
+                # 画面外はメモリ解放（プレースホルダに戻す）
+                label.clear()
+                self._rendered.discard(i)
+
+    def _update_current_page(self) -> None:
+        """ビューポート中央にあるページを現在ページとして扱う。"""
+        if not self._labels:
+            return
+        center = self.verticalScrollBar().value() + self.viewport().height() // 2
+        for i, label in enumerate(self._labels):
+            if label.y() <= center < label.y() + label.height() + PAGE_SPACING:
+                self._set_index(i)
+                return
+
+    def _set_index(self, index: int) -> None:
+        if index != self._index:
+            self._index = index
+            self.page_changed.emit(index)

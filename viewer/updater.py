@@ -1,0 +1,158 @@
+"""自動アップデータ（Windows・onedir 配布向け）。
+
+公開された update.json を取得し、現在版より新しければビルド済み zip を
+ダウンロード→展開→アプリフォルダを入れ替え→再起動する。
+
+凍結 exe は自分自身を上書きできないため、アプリ終了後に置換するヘルパー
+バッチ(.cmd)をデタッチ起動して実現する。ユーザーデータ（PDFEditor_data,
+*.ini マーカー）は保持する。
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import urllib.request
+import zipfile
+
+from . import storage
+from . import version as _ver
+from .version import APP_VERSION
+
+
+def is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def manifest_url(settings=None) -> str:
+    """更新元URLを決める。優先順: 設定の上書き → 直接指定 → GITHUB_REPO 由来。"""
+    if settings is not None:
+        u = settings.value("update_url", "", str)
+        if u:
+            return u
+    if _ver.UPDATE_MANIFEST_URL:
+        return _ver.UPDATE_MANIFEST_URL
+    return _ver.github_manifest_url()
+
+
+def _parse_version(v: str) -> tuple:
+    parts = []
+    for token in str(v).strip().split("."):
+        num = "".join(ch for ch in token if ch.isdigit())
+        parts.append(int(num) if num else 0)
+    return tuple(parts) or (0,)
+
+
+def is_newer(remote: str, local: str = APP_VERSION) -> bool:
+    return _parse_version(remote) > _parse_version(local)
+
+
+def check(url: str, timeout: int = 10) -> dict | None:
+    """update.json を取得。新しい版があれば dict、無ければ None。"""
+    if not url:
+        return None
+    req = urllib.request.Request(url, headers={"User-Agent": "PDFEditor-Updater"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if data.get("version") and is_newer(data["version"]):
+        return data
+    return None
+
+
+def download(url: str, progress=None) -> str:
+    """zip をダウンロードして一時パスを返す。progress(done,total)->bool で中断可。"""
+    dst = os.path.join(tempfile.gettempdir(), "pdfeditor_update.zip")
+
+    def _hook(block, blocksize, total):
+        if progress:
+            done = block * blocksize
+            if not progress(min(done, total) if total > 0 else done, total):
+                raise RuntimeError("キャンセルされました")
+
+    req = urllib.request.Request(url, headers={"User-Agent": "PDFEditor-Updater"})
+    with urllib.request.urlopen(req) as resp, open(dst, "wb") as f:
+        total = int(resp.headers.get("Content-Length", 0))
+        done = 0
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if progress and not progress(done, total):
+                raise RuntimeError("キャンセルされました")
+    return dst
+
+
+def sha256(path: str) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify(path: str, expected: str) -> bool:
+    """expected が指定されていれば SHA256 を照合（未指定なら True）。"""
+    if not expected:
+        return True
+    return sha256(path).lower() == expected.strip().lower()
+
+
+def _extract(zip_path: str) -> str:
+    """zip を展開し、exe を含むフォルダ（新バージョン一式）のパスを返す。"""
+    out = os.path.join(tempfile.gettempdir(), "pdfeditor_update_extract")
+    if os.path.isdir(out):
+        import shutil
+        shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as z:
+        z.extractall(out)
+    exe_name = os.path.basename(sys.executable)
+    for root, _dirs, files in os.walk(out):
+        if exe_name in files:
+            return root
+    # 見つからなければ展開直下を返す
+    return out
+
+
+def apply_and_restart(zip_path: str) -> None:
+    """新バージョンを展開し、終了後に入れ替えるヘルパーを起動してアプリを終了させる。
+
+    呼び出し側は本関数の後に QApplication.quit() すること。
+    """
+    src_dir = _extract(zip_path)
+    app_dir = storage.base_dir()
+    exe_path = sys.executable
+    pid = os.getpid()
+    helper = os.path.join(tempfile.gettempdir(), "pdfeditor_update.cmd")
+
+    # robocopy /E: 上書きコピー（/MIR と違い既存のユーザーデータを消さない）
+    # /XD: ユーザーデータフォルダ除外、 /XF: マーカー/設定の保持
+    script = f"""@echo off
+chcp 65001 >nul
+echo 更新を適用しています。しばらくお待ちください...
+:waitloop
+tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul
+if not errorlevel 1 (
+  timeout /t 1 /nobreak >nul
+  goto waitloop
+)
+robocopy "{src_dir}" "{app_dir}" /E /NFL /NDL /NJH /NJS /NP /R:3 /W:1 /XD "PDFEditor_data" /XF "portable.ini" "lite.ini" "PDFEditor.ini" >nul
+start "" "{exe_path}"
+del "%~f0"
+"""
+    with open(helper, "w", encoding="utf-8") as f:
+        f.write(script)
+
+    import subprocess
+    # 新しいコンソールでデタッチ起動（親終了後も生存）
+    subprocess.Popen(
+        ["cmd", "/c", helper],
+        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        | getattr(subprocess, "DETACHED_PROCESS", 0),
+        close_fds=True,
+    )

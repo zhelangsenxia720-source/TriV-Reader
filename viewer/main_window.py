@@ -1,0 +1,2104 @@
+"""メインウィンドウ。ツールバー・サムネイル・ページビューを束ねる。"""
+from __future__ import annotations
+
+import os
+
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QColor,
+    QFont,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+)
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+from PySide6.QtWidgets import (
+    QApplication,
+    QColorDialog,
+    QComboBox,
+    QDockWidget,
+    QFileDialog,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressDialog,
+    QSlider,
+    QSpinBox,
+    QStackedWidget,
+    QSystemTrayIcon,
+    QTabWidget,
+)
+
+from . import ocr, page_view, theme
+from .bookmarks import TocDock, TocEditDialog
+from .document import PdfDocument
+from .organizer import PageOrganizer
+from .page_view import PageView
+from .thumbnail_list import ThumbnailList
+from .welcome import WelcomeWidget
+
+ZOOM_STEP = 1.25
+
+
+def _parse_ranges(text: str, page_count: int) -> list[int]:
+    """"1-3,5,8" のような 1 始まりの指定を 0 始まりのインデックス列にする。
+
+    順序は入力どおり保持する（並べ替え抽出に使えるよう）。
+    """
+    indices: list[int] = []
+    for token in text.replace(" ", "").split(","):
+        if not token:
+            continue
+        if "-" in token:
+            a, b = token.split("-", 1)
+            start, end = int(a), int(b)
+            step = 1 if end >= start else -1
+            for p in range(start, end + step, step):
+                indices.append(p - 1)
+        else:
+            indices.append(int(token) - 1)
+    if not indices:
+        raise ValueError("ページが指定されていません")
+    for i in indices:
+        if i < 0 or i >= page_count:
+            raise ValueError(f"範囲外のページ番号です（1〜{page_count}）")
+    return indices
+
+
+class DocTab(QStackedWidget):
+    """1 つの PDF を表すタブ。自前の文書・ビューワー・整理画面を持つ。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.doc = PdfDocument()
+        self.page_view = PageView()
+        self.organizer = PageOrganizer()
+        self.addWidget(self.page_view)   # index 0
+        self.addWidget(self.organizer)   # index 1
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("PDF Editor")
+        self.resize(1180, 820)
+        self.setAcceptDrops(True)
+        from . import storage
+        self.settings = storage.make_settings()  # 通常=レジストリ / ポータブル=INI
+
+        # タブが無いとき用の空状態（属性アクセスを安全にする）
+        self._empty_doc = PdfDocument()
+        self._spare_view = PageView()
+        self._spare_organizer = PageOrganizer()
+
+        self.welcome = WelcomeWidget()
+        self.welcome.open_requested.connect(self.open_file)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.tabCloseRequested.connect(self._close_tab)
+        # ウェルカム ⇔ タブ群 を切り替える中央スタック
+        self.center = QStackedWidget()
+        self.center.addWidget(self.welcome)  # 0
+        self.center.addWidget(self.tabs)     # 1
+        self.center.setCurrentWidget(self.welcome)
+        self.setCentralWidget(self.center)
+
+        self.thumbnails = ThumbnailList()
+        dock = QDockWidget("ページ", self)
+        dock.setWidget(self.thumbnails)
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+
+        # しおり（目次）ドック：ページドックとタブで重ねる
+        self.toc_dock = TocDock(self)
+        self.toc_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.toc_dock)
+        self.tabifyDockWidget(dock, self.toc_dock)
+        dock.raise_()
+
+        self.page_label = QLabel("  ページ: - / -  ")
+        self.statusBar().addPermanentWidget(self.page_label)
+
+        self._build_toolbar()
+        self._build_annotation_toolbar()
+        self._build_search_toolbar()
+        self._build_menubar()
+        self._connect()
+        self._polish_actions()
+        self._apply_lite_mode()
+        self._update_actions()
+        self._restore_settings()
+        self._force_quit = False
+        self._tray_notified = False
+        self._setup_tray()
+
+    # --- アクティブタブへのアクセス（プロパティ） ---------------------
+    def _active_tab(self) -> "DocTab | None":
+        w = self.tabs.currentWidget()
+        return w if isinstance(w, DocTab) else None
+
+    @property
+    def doc(self) -> PdfDocument:
+        t = self._active_tab()
+        return t.doc if t else self._empty_doc
+
+    @property
+    def page_view(self) -> PageView:
+        t = self._active_tab()
+        return t.page_view if t else self._spare_view
+
+    @property
+    def organizer(self) -> PageOrganizer:
+        t = self._active_tab()
+        return t.organizer if t else self._spare_organizer
+
+    # --- UI 構築 --------------------------------------------------------
+    def _build_toolbar(self) -> None:
+        tb = self.addToolBar("メイン")
+        tb.setMovable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.main_toolbar = tb
+
+        self.act_open = QAction("開く", self)
+        self.act_open.setShortcut(QKeySequence.StandardKey.Open)
+        tb.addAction(self.act_open)
+        tb.addSeparator()
+
+        self.act_prev = QAction("◀ 前へ", self)
+        self.act_prev.setShortcut(Qt.Key.Key_PageUp)
+        self.act_next = QAction("次へ ▶", self)
+        self.act_next.setShortcut(Qt.Key.Key_PageDown)
+        tb.addAction(self.act_prev)
+        tb.addAction(self.act_next)
+        tb.addSeparator()
+
+        self.act_zoom_in = QAction("＋ 拡大", self)
+        self.act_zoom_in.setShortcut(QKeySequence.StandardKey.ZoomIn)
+        self.act_zoom_out = QAction("－ 縮小", self)
+        self.act_zoom_out.setShortcut(QKeySequence.StandardKey.ZoomOut)
+        self.act_fit = QAction("幅に合わせる", self)
+        tb.addAction(self.act_zoom_out)
+        tb.addAction(self.act_zoom_in)
+        tb.addAction(self.act_fit)
+        # ズームスライダー＋プリセット
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(25, 400)   # 25%〜400%
+        self.zoom_slider.setValue(100)
+        self.zoom_slider.setFixedWidth(120)
+        tb.addWidget(self.zoom_slider)
+        self.zoom_combo = QComboBox()
+        self.zoom_combo.addItems(["50%", "75%", "100%", "125%", "150%", "200%", "幅に合わせる"])
+        self.zoom_combo.setCurrentText("100%")
+        tb.addWidget(self.zoom_combo)
+        tb.addSeparator()
+
+        self.act_facing = QAction("見開き", self)
+        self.act_facing.setCheckable(True)
+        tb.addAction(self.act_facing)
+        self.act_print = QAction("印刷", self)
+        self.act_print.setShortcut(QKeySequence.StandardKey.Print)
+        tb.addAction(self.act_print)
+        tb.addSeparator()
+
+        self.act_rotate_left = QAction("⟲ 左回転", self)
+        self.act_rotate_left.setShortcut("Ctrl+L")
+        self.act_rotate_right = QAction("⟳ 右回転", self)
+        self.act_rotate_right.setShortcut("Ctrl+R")
+        tb.addAction(self.act_rotate_left)
+        tb.addAction(self.act_rotate_right)
+        tb.addSeparator()
+
+        self.act_save = QAction("上書き保存", self)
+        self.act_save.setShortcut(QKeySequence.StandardKey.Save)
+        self.act_save_as = QAction("名前を付けて保存", self)
+        self.act_save_as.setShortcut(QKeySequence.StandardKey.SaveAs)
+        tb.addAction(self.act_save)
+        tb.addAction(self.act_save_as)
+        tb.addSeparator()
+
+        self.act_organize = QAction("ページ整理", self)
+        self.act_organize.setCheckable(True)
+        tb.addAction(self.act_organize)
+        tb.addSeparator()
+
+        self.act_delete = QAction("ページ削除", self)
+        self.act_merge = QAction("PDFを統合", self)
+        self.act_extract = QAction("抽出", self)
+        self.act_split = QAction("分割", self)
+        tb.addAction(self.act_delete)
+        tb.addAction(self.act_merge)
+        tb.addAction(self.act_extract)
+        tb.addAction(self.act_split)
+        tb.addSeparator()
+
+        self.act_to_images = QAction("PDF→画像", self)
+        self.act_from_images = QAction("画像→PDF", self)
+        self.act_add_images = QAction("画像をページ追加", self)
+        tb.addAction(self.act_to_images)
+        tb.addAction(self.act_from_images)
+        tb.addAction(self.act_add_images)
+        tb.addSeparator()
+
+        self.act_ocr = QAction("文字認識(OCR)", self)
+        tb.addAction(self.act_ocr)
+
+        # メニュー専用アクション（ツールバーには出さない）
+        self.act_add_bookmark = QAction("現在ページをしおりに追加", self)
+        self.act_edit_toc = QAction("目次を編集…", self)
+        self.act_compress = QAction("最適化して保存…", self)
+        self.act_export_pdfa = QAction("PDF/A で書き出し…", self)
+        self.act_protect = QAction("パスワードで保護して保存…", self)
+        self.act_unlock = QAction("パスワードを解除して保存…", self)
+        self.act_watermark = QAction("透かしを追加…", self)
+        self.act_header_footer = QAction("ヘッダー/フッターを追加…", self)
+        self.act_blank_page = QAction("白紙ページを挿入", self)
+        self.act_duplicate_page = QAction("現在ページを複製", self)
+        self.act_autocrop = QAction("全ページの余白を自動トリミング", self)
+        self.act_metadata = QAction("文書プロパティ(メタデータ)…", self)
+        self.act_export_text = QAction("テキストに書き出し(.txt)…", self)
+        self.act_export_html = QAction("HTMLに書き出し…", self)
+        self.act_batch = QAction("バッチ処理（複数PDF）…", self)
+        self.act_diff = QAction("2つのPDFを比較…", self)
+        self.act_deskew = QAction("傾き補正（スキャン）", self)
+        self.act_check_update = QAction("更新を確認…", self)
+        self.act_about = QAction("バージョン情報", self)
+        self.act_set_update_url = QAction("更新元URLを設定…", self)
+        self.act_dark = QAction("ダークモード", self)
+        self.act_dark.setCheckable(True)
+        self.act_compact = QAction("コンパクト表示（アイコンのみ）", self)
+        self.act_compact.setCheckable(True)
+        self.act_copy = QAction("選択テキストをコピー", self)
+        self.act_copy.setShortcut(QKeySequence.StandardKey.Copy)
+        self.act_copy.setEnabled(False)
+        self.addAction(self.act_copy)  # ショートカットを有効化
+
+    def _build_annotation_toolbar(self) -> None:
+        """注釈ツール用の2段目ツールバー。"""
+        tb = self.addToolBar("注釈")
+        tb.setMovable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.annot_toolbar = tb
+
+        self.tool_group = QActionGroup(self)
+        self.tool_group.setExclusive(True)
+
+        def add_tool(text: str, tool: str, checked: bool = False) -> QAction:
+            act = QAction(text, self)
+            act.setCheckable(True)
+            act.setChecked(checked)
+            act.setData(tool)
+            self.tool_group.addAction(act)
+            tb.addAction(act)
+            return act
+
+        self.act_tool_none = add_tool("選択", page_view.TOOL_NONE, checked=True)
+        self.act_tool_highlight = add_tool("ハイライト", page_view.TOOL_HIGHLIGHT)
+        self.act_tool_pen = add_tool("ペン", page_view.TOOL_PEN)
+        self.act_tool_rect = add_tool("四角", page_view.TOOL_RECT)
+        self.act_tool_underline = add_tool("下線", page_view.TOOL_UNDERLINE)
+        self.act_tool_strike = add_tool("取消線", page_view.TOOL_STRIKEOUT)
+        self.act_tool_line = add_tool("直線", page_view.TOOL_LINE)
+        self.act_tool_arrow = add_tool("矢印", page_view.TOOL_ARROW)
+        self.act_tool_circle = add_tool("円", page_view.TOOL_CIRCLE)
+        self.act_tool_text = add_tool("テキスト", page_view.TOOL_TEXT)
+        self.act_tool_note = add_tool("付箋", page_view.TOOL_NOTE)
+        self.act_tool_redact = add_tool("墨消し", page_view.TOOL_REDACT)
+        self.act_tool_crop = add_tool("トリミング", page_view.TOOL_CROP)
+        self.act_tool_erase = add_tool("消しゴム", page_view.TOOL_ERASE)
+        tb.addSeparator()
+
+        # 色ボタン（現在色を表示）
+        self.act_color = QAction("色", self)
+        tb.addAction(self.act_color)
+        self._annot_color = QColor(255, 219, 46)
+        self._refresh_color_icon()
+
+        # 線の太さ
+        tb.addWidget(QLabel(" 太さ "))
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(1, 20)
+        self.width_spin.setValue(2)
+        tb.addWidget(self.width_spin)
+        tb.addSeparator()
+
+        self.act_apply_redact = QAction("墨消しを適用", self)
+        tb.addAction(self.act_apply_redact)
+        self.act_clear_annots = QAction("このページの注釈を全消去", self)
+        tb.addAction(self.act_clear_annots)
+
+    def _build_search_toolbar(self) -> None:
+        """検索バー（別段）。"""
+        self.addToolBarBreak()
+        tb = self.addToolBar("検索")
+        tb.setMovable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.search_toolbar = tb
+        tb.addWidget(QLabel(" 検索 "))
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("テキストを検索… (Enter)")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setMaximumWidth(320)
+        tb.addWidget(self.search_edit)
+        self.act_search_prev = QAction("◀ 前", self)
+        self.act_search_next = QAction("次 ▶", self)
+        tb.addAction(self.act_search_prev)
+        tb.addAction(self.act_search_next)
+        self.search_count_label = QLabel("  0 件  ")
+        tb.addWidget(self.search_count_label)
+        self.act_highlight_all = QAction("全てハイライト", self)
+        tb.addAction(self.act_highlight_all)
+
+        # ページ番号
+        self.act_page_numbers = QAction("ページ番号を追加…", self)
+
+        # Ctrl+F で検索欄へフォーカス
+        self.act_find = QAction("検索", self)
+        self.act_find.setShortcut(QKeySequence.StandardKey.Find)
+        self.addAction(self.act_find)
+
+    def _build_menubar(self) -> None:
+        """全機能をメニューに整理（ツールバーの混雑緩和）。"""
+        mb = self.menuBar()
+
+        m_file = mb.addMenu("ファイル(&F)")
+        m_file.addAction(self.act_open)
+        self.recent_menu = QMenu("最近開いたファイル", self)
+        m_file.addMenu(self.recent_menu)
+        m_file.addSeparator()
+        m_file.addAction(self.act_save)
+        m_file.addAction(self.act_save_as)
+        m_file.addSeparator()
+        m_file.addAction(self.act_print)
+        m_file.addSeparator()
+        m_file.addAction(self.act_compress)
+        m_file.addAction(self.act_export_pdfa)
+        m_file.addSeparator()
+        m_file.addAction(self.act_protect)
+        m_file.addAction(self.act_unlock)
+
+        m_view = mb.addMenu("表示(&V)")
+        m_view.addAction(self.act_dark)
+        m_view.addAction(self.act_compact)
+        m_view.addSeparator()
+        # 注釈バーの表示/非表示（折りたたみ）
+        self.act_toggle_annotbar = self.annot_toolbar.toggleViewAction()
+        self.act_toggle_annotbar.setText("注釈バーを表示")
+        m_view.addAction(self.act_toggle_annotbar)
+        self.act_toggle_searchbar = self.search_toolbar.toggleViewAction()
+        self.act_toggle_searchbar.setText("検索バーを表示")
+        m_view.addAction(self.act_toggle_searchbar)
+        m_view.addSeparator()
+        m_view.addAction(self.act_copy)
+        m_view.addSeparator()
+        m_view.addAction(self.act_prev)
+        m_view.addAction(self.act_next)
+        m_view.addSeparator()
+        m_view.addAction(self.act_zoom_in)
+        m_view.addAction(self.act_zoom_out)
+        m_view.addAction(self.act_fit)
+        m_view.addSeparator()
+        m_view.addAction(self.act_rotate_left)
+        m_view.addAction(self.act_rotate_right)
+
+        m_pages = mb.addMenu("ページ(&P)")
+        m_pages.addAction(self.act_organize)
+        m_pages.addSeparator()
+        m_pages.addAction(self.act_delete)
+        m_pages.addAction(self.act_merge)
+        m_pages.addAction(self.act_extract)
+        m_pages.addAction(self.act_split)
+        m_pages.addSeparator()
+        m_pages.addAction(self.act_blank_page)
+        m_pages.addAction(self.act_duplicate_page)
+        m_pages.addAction(self.act_autocrop)
+        m_pages.addSeparator()
+        m_pages.addAction(self.act_page_numbers)
+        m_pages.addAction(self.act_header_footer)
+        m_pages.addAction(self.act_watermark)
+
+        m_annot = mb.addMenu("注釈(&A)")
+        for act in self.tool_group.actions():
+            m_annot.addAction(act)
+        m_annot.addSeparator()
+        m_annot.addAction(self.act_color)
+        m_annot.addAction(self.act_apply_redact)
+        m_annot.addAction(self.act_clear_annots)
+
+        m_book = mb.addMenu("しおり(&B)")
+        m_book.addAction(self.act_add_bookmark)
+        m_book.addAction(self.act_edit_toc)
+        m_book.addSeparator()
+        m_book.addAction(self.toc_dock.toggleViewAction())
+
+        m_conv = mb.addMenu("変換(&C)")
+        m_conv.addAction(self.act_to_images)
+        m_conv.addAction(self.act_from_images)
+        m_conv.addAction(self.act_add_images)
+        m_conv.addSeparator()
+        m_conv.addAction(self.act_ocr)
+        m_conv.addAction(self.act_deskew)
+        m_conv.addSeparator()
+        m_conv.addAction(self.act_export_text)
+        m_conv.addAction(self.act_export_html)
+        m_conv.addAction(self.act_metadata)
+        m_conv.addSeparator()
+        m_conv.addAction(self.act_batch)
+        m_conv.addAction(self.act_diff)
+
+        m_help = mb.addMenu("ヘルプ(&H)")
+        m_help.addAction(self.act_check_update)
+        m_help.addAction(self.act_set_update_url)
+        m_help.addSeparator()
+        m_help.addAction(self.act_about)
+
+    def _apply_lite_mode(self) -> None:
+        """ライト版では OCR・傾き補正（numpy/Pillow 依存）の機能を隠す。"""
+        from . import storage
+
+        self.is_lite = storage.is_lite()
+        if self.is_lite:
+            self.act_ocr.setVisible(False)
+            self.act_deskew.setVisible(False)
+            self.setWindowTitle("PDF Editor (Lite)")
+
+    def _polish_actions(self) -> None:
+        """各アクションにツールチップ/ステータスヒントを付ける（ショートカット併記）。"""
+        tips = {
+            self.act_open: "PDF ファイルを開きます",
+            self.act_save: "上書き保存します",
+            self.act_save_as: "名前を付けて保存します",
+            self.act_print: "印刷します",
+            self.act_prev: "前のページへ",
+            self.act_next: "次のページへ",
+            self.act_zoom_in: "拡大",
+            self.act_zoom_out: "縮小",
+            self.act_fit: "ページ幅に合わせる",
+            self.act_facing: "2ページずつ並べて表示（見開き）",
+            self.act_rotate_left: "左に90°回転",
+            self.act_rotate_right: "右に90°回転",
+            self.act_organize: "ページの並べ替え・削除・抽出を行う整理画面",
+            self.act_find: "文書内のテキストを検索",
+            self.act_copy: "選択したテキストをコピー",
+            self.act_dark: "ダークモードの切り替え",
+            self.act_color: "注釈の色を選択",
+            self.act_apply_redact: "登録した墨消しを適用して内容を完全削除",
+            self.act_ocr: "画像/スキャンPDFを文字認識して検索可能にする",
+            self.act_deskew: "スキャンの傾きを自動補正",
+        }
+        for act, tip in tips.items():
+            seq = act.shortcut()
+            sc = "" if seq.isEmpty() else seq.toString()
+            act.setToolTip(f"{tip}（{sc}）" if sc else tip)
+            act.setStatusTip(tip)
+        # ツール群のヒント
+        tool_tips = {
+            page_view.TOOL_NONE: "選択：テキスト選択・注釈の選択/移動",
+            page_view.TOOL_HIGHLIGHT: "文字をなぞってハイライト",
+            page_view.TOOL_PEN: "フリーハンドで描画",
+            page_view.TOOL_RECT: "四角を描く",
+            page_view.TOOL_UNDERLINE: "文字に下線",
+            page_view.TOOL_STRIKEOUT: "文字に取り消し線",
+            page_view.TOOL_LINE: "直線を引く",
+            page_view.TOOL_ARROW: "矢印を引く",
+            page_view.TOOL_CIRCLE: "円/楕円を描く",
+            page_view.TOOL_TEXT: "テキストボックスを追加",
+            page_view.TOOL_NOTE: "付箋メモを追加",
+            page_view.TOOL_REDACT: "墨消し範囲を指定（適用で完全削除）",
+            page_view.TOOL_CROP: "トリミング範囲を指定",
+            page_view.TOOL_ERASE: "注釈をクリックして削除",
+        }
+        for act in self.tool_group.actions():
+            tip = tool_tips.get(act.data())
+            if tip:
+                act.setToolTip(tip)
+                act.setStatusTip(tip)
+        self._assign_icons()
+
+    # --- アイコン / コンパクト表示 ------------------------------------
+    def _glyph_icon(self, glyph: str) -> QIcon:
+        """記号/絵文字を描いた小さなアイコンを生成（コンパクト表示用）。"""
+        size = 36
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p.setPen(self.palette().color(self.foregroundRole()))
+        f = QFont()
+        f.setPointSize(16)
+        p.setFont(f)
+        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, glyph)
+        p.end()
+        return QIcon(pm)
+
+    def _assign_icons(self) -> None:
+        glyphs = {
+            self.act_open: "📂", self.act_save: "💾", self.act_save_as: "📝",
+            self.act_print: "🖨", self.act_prev: "◀", self.act_next: "▶",
+            self.act_zoom_in: "➕", self.act_zoom_out: "➖", self.act_fit: "↔",
+            self.act_facing: "📖", self.act_rotate_left: "↺", self.act_rotate_right: "↻",
+            self.act_organize: "🗂", self.act_delete: "🗑", self.act_merge: "🔗",
+            self.act_extract: "📤", self.act_split: "✂", self.act_to_images: "🖼",
+            self.act_from_images: "📥", self.act_add_images: "🏞", self.act_ocr: "🔡",
+            self.act_deskew: "📐", self.act_apply_redact: "✅",
+            self.act_clear_annots: "🧹", self.act_highlight_all: "🖍",
+            self.act_search_prev: "◀", self.act_search_next: "▶",
+        }
+        for act, g in glyphs.items():
+            act.setIcon(self._glyph_icon(g))
+        tool_glyphs = {
+            page_view.TOOL_NONE: "🖱", page_view.TOOL_HIGHLIGHT: "🖍",
+            page_view.TOOL_PEN: "✏", page_view.TOOL_RECT: "▭",
+            page_view.TOOL_UNDERLINE: "U", page_view.TOOL_STRIKEOUT: "S",
+            page_view.TOOL_LINE: "／", page_view.TOOL_ARROW: "↗",
+            page_view.TOOL_CIRCLE: "◯", page_view.TOOL_TEXT: "T",
+            page_view.TOOL_NOTE: "📌", page_view.TOOL_REDACT: "▉",
+            page_view.TOOL_CROP: "◳", page_view.TOOL_ERASE: "⌫",
+        }
+        for act in self.tool_group.actions():
+            g = tool_glyphs.get(act.data())
+            if g:
+                act.setIcon(self._glyph_icon(g))
+
+    def _set_compact(self, on: bool) -> None:
+        """ツールバーをアイコンのみ（省スペース）/ 文字ラベル に切り替える。
+
+        コンパクト時はボタン・ツールバーの余白も詰めて縦幅をさらに小さくする。
+        """
+        style = (Qt.ToolButtonStyle.ToolButtonIconOnly if on
+                 else Qt.ToolButtonStyle.ToolButtonTextOnly)
+        # コンパクト時のみ、各ツールバー限定で余白を最小化（全体QSSより優先）
+        compact_qss = (
+            "QToolBar { padding: 0px; spacing: 1px; }"
+            "QToolButton { padding: 2px; margin: 0px; border-radius: 4px; }"
+        )
+        for tb in (self.main_toolbar, self.annot_toolbar, self.search_toolbar):
+            tb.setToolButtonStyle(style)
+            tb.setIconSize(QSize(18, 18) if on else QSize(16, 16))
+            tb.setContentsMargins(0, 0, 0, 0)
+            tb.setStyleSheet(compact_qss if on else "")
+
+    def _refresh_color_icon(self) -> None:
+        """色ボタンに現在の色のアイコンを表示する。"""
+        from PySide6.QtGui import QPixmap
+
+        pm = QPixmap(18, 18)
+        pm.fill(self._annot_color)
+        self.act_color.setIcon(pm)
+
+    def _connect(self) -> None:
+        self.act_open.triggered.connect(self.open_file)
+        self.act_prev.triggered.connect(lambda: self._goto(self.page_view.index - 1))
+        self.act_next.triggered.connect(lambda: self._goto(self.page_view.index + 1))
+        self.act_zoom_in.triggered.connect(
+            lambda: self.page_view.set_zoom(self.page_view.zoom * ZOOM_STEP)
+        )
+        self.act_zoom_out.triggered.connect(
+            lambda: self.page_view.set_zoom(self.page_view.zoom / ZOOM_STEP)
+        )
+        self.act_fit.triggered.connect(self._fit)
+        self.act_rotate_left.triggered.connect(lambda: self._rotate(-90))
+        self.act_rotate_right.triggered.connect(lambda: self._rotate(90))
+        self.act_save.triggered.connect(self.save)
+        self.act_save_as.triggered.connect(self.save_as)
+        self.act_delete.triggered.connect(lambda: self._delete_page(self.page_view.index))
+        self.act_merge.triggered.connect(self.merge_pdf)
+        self.act_extract.triggered.connect(self.extract_pages)
+        self.act_split.triggered.connect(self.split_pdf)
+        self.act_organize.toggled.connect(self._toggle_organize)
+        self.act_to_images.triggered.connect(self.export_images_dialog)
+        self.act_from_images.triggered.connect(self.images_to_pdf_dialog)
+        self.act_add_images.triggered.connect(self.add_images_as_pages)
+        self.act_ocr.triggered.connect(self.run_ocr)
+        # 注釈ツール
+        self.tool_group.triggered.connect(self._on_tool_changed)
+        self.act_color.triggered.connect(self._pick_color)
+        self.width_spin.valueChanged.connect(lambda v: self.page_view.set_pen_width(v))
+        self.act_clear_annots.triggered.connect(self._clear_annots)
+        # しおり / 最適化 / PDF-A
+        self.act_add_bookmark.triggered.connect(self._add_bookmark)
+        self.act_edit_toc.triggered.connect(self._edit_toc)
+        self.act_compress.triggered.connect(self.compress_save)
+        self.act_export_pdfa.triggered.connect(self.export_pdfa)
+        self.toc_dock.page_requested.connect(self._goto)
+        # 検索 / ページ番号
+        self.search_edit.returnPressed.connect(self._do_search)
+        self.act_search_next.triggered.connect(lambda: self._search_step(1))
+        self.act_search_prev.triggered.connect(lambda: self._search_step(-1))
+        self.act_find.triggered.connect(self._focus_search)
+        self.act_highlight_all.triggered.connect(self._highlight_all_hits)
+        self.act_page_numbers.triggered.connect(self.add_page_numbers_dialog)
+        # パスワード / テーマ
+        self.act_protect.triggered.connect(self.protect_save)
+        self.act_unlock.triggered.connect(self.unlock_save)
+        self.act_dark.toggled.connect(self._toggle_dark)
+        self.act_compact.toggled.connect(self._set_compact)
+        self.act_copy.triggered.connect(self._copy_text)
+        # 墨消し適用・ページ操作・透かし・メタ・抽出
+        self.act_apply_redact.triggered.connect(self._apply_redactions)
+        self.act_blank_page.triggered.connect(self._insert_blank_page)
+        self.act_duplicate_page.triggered.connect(self._duplicate_page)
+        self.act_autocrop.triggered.connect(self._auto_crop_all)
+        self.act_watermark.triggered.connect(self.add_watermark_dialog)
+        self.act_header_footer.triggered.connect(self.add_header_footer_dialog)
+        self.act_metadata.triggered.connect(self.edit_metadata_dialog)
+        self.act_export_text.triggered.connect(lambda: self._export_text(False))
+        self.act_export_html.triggered.connect(lambda: self._export_text(True))
+        # ズーム / 印刷
+        self.zoom_slider.sliderMoved.connect(
+            lambda v: self.page_view.set_zoom(v / 100.0)
+        )
+        self.zoom_combo.activated.connect(self._on_zoom_preset)
+        self.act_print.triggered.connect(self.print_document)
+        self.act_facing.toggled.connect(self._toggle_facing)
+        self.act_batch.triggered.connect(self.batch_dialog)
+        self.act_diff.triggered.connect(self.diff_dialog)
+        self.act_deskew.triggered.connect(self.deskew_document)
+        self.act_check_update.triggered.connect(self.check_for_update)
+        self.act_set_update_url.triggered.connect(self.set_update_url)
+        self.act_about.triggered.connect(self.show_about)
+        # 共有ドック（アクティブタブに対して動作）
+        self.thumbnails.page_selected.connect(self._goto)
+        self.thumbnails.pages_reordered.connect(self._reorder)
+        self.thumbnails.delete_requested.connect(self._delete_page)
+        # 注: page_view / organizer のシグナルはタブ毎に _new_tab で接続する
+
+    def _new_tab(self) -> "DocTab":
+        """新しいドキュメントタブを作り、ビューワー/整理画面のシグナルを接続する。"""
+        tab = DocTab()
+        pv, org = tab.page_view, tab.organizer
+        pv.page_changed.connect(self._on_page_changed)
+        pv.annotation_changed.connect(self._on_annotation_changed)
+        pv.selection_changed.connect(self._on_selection_changed)
+        pv.text_selection_changed.connect(self._on_text_selection_changed)
+        pv.zoom_changed.connect(self._on_zoom_changed)
+        org.reordered.connect(self._reorder_from_organizer)
+        org.delete_requested.connect(self._delete_pages)
+        org.extract_requested.connect(self._extract_indices)
+        org.rotate_requested.connect(self._rotate_pages)
+        org.split_requested.connect(self.split_pdf)
+        org.export_images_requested.connect(self._export_indices_images)
+        org.page_activated.connect(self._jump_from_organizer)
+        dark = self.act_dark.isChecked()
+        pv.set_canvas_color(theme.canvas_color(dark))
+        org.apply_theme(dark)
+        return tab
+
+    # --- 操作 -----------------------------------------------------------
+    def open_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "PDF を開く", self._last_dir(), "PDF ファイル (*.pdf)"
+        )
+        if path:
+            self.open_path(path)
+
+    def open_path(self, path: str) -> None:
+        # 既に同じファイルを開いていれば、そのタブへ切り替える
+        for i in range(self.tabs.count()):
+            t = self.tabs.widget(i)
+            if isinstance(t, DocTab) and t.doc.path and os.path.abspath(t.doc.path) == os.path.abspath(path):
+                self.tabs.setCurrentIndex(i)
+                return
+
+        tab = self._new_tab()
+        doc = tab.doc
+        try:
+            doc.open(path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"開けませんでした:\n{exc}")
+            tab.deleteLater()
+            return
+        # 暗号化PDF: 使い捨て複製でパスワードを確定してから本体を開く
+        if doc.needs_password:
+            doc.close()
+            password = None
+            while True:
+                pw, ok = QInputDialog.getText(
+                    self, "パスワード", f"「{os.path.basename(path)}」のパスワード:",
+                    QLineEdit.EchoMode.Password,
+                )
+                if not ok:
+                    tab.deleteLater()
+                    return
+                if PdfDocument.check_password(path, pw):
+                    password = pw
+                    break
+                QMessageBox.warning(self, "認証失敗", "パスワードが違います")
+            doc.open(path, password=password)
+
+        tab.page_view.set_document(doc)
+        idx = self.tabs.addTab(tab, os.path.basename(path))
+        self.tabs.setTabToolTip(idx, path)
+        self.center.setCurrentWidget(self.tabs)
+        self.tabs.setCurrentIndex(idx)  # _on_tab_changed が読み込み・更新を行う
+        QApplication.processEvents()
+        tab.page_view.fit_width()
+        self._add_recent(path)
+
+    def activate_and_open(self, path: str) -> None:
+        """別インスタンスから渡されたパスを開き、ウィンドウを前面化する。"""
+        if path:
+            self.open_path(path)
+        # 最小化されていれば戻し、前面へ
+        self.setWindowState(
+            (self.windowState() & ~Qt.WindowState.WindowMinimized)
+            | Qt.WindowState.WindowActive
+        )
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    # --- システムトレイ常駐 --------------------------------------------
+    def _setup_tray(self) -> None:
+        """タスクトレイに常駐させる（閉じても裏で起動を保ち、次回を高速化）。"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = None
+            return
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = QApplication.windowIcon()
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip("PDF Editor")
+        menu = QMenu()
+        act_show = menu.addAction("ウィンドウを表示")
+        act_show.triggered.connect(self._show_from_tray)
+        menu.addSeparator()
+        self.act_tray_resident = menu.addAction("閉じてもトレイに常駐")
+        self.act_tray_resident.setCheckable(True)
+        self.act_tray_resident.setChecked(
+            self.settings.value("tray/resident", True, type=bool)
+        )
+        self.act_tray_resident.toggled.connect(
+            lambda on: self.settings.setValue("tray/resident", on)
+        )
+        menu.addSeparator()
+        act_quit = menu.addAction("終了")
+        act_quit.triggered.connect(self._quit_app)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _tray_resident_enabled(self) -> bool:
+        return (
+            getattr(self, "tray", None) is not None
+            and self.act_tray_resident.isChecked()
+        )
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._show_from_tray()
+
+    def _show_from_tray(self) -> None:
+        self.setWindowState(
+            (self.windowState() & ~Qt.WindowState.WindowMinimized)
+            | Qt.WindowState.WindowActive
+        )
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_app(self) -> None:
+        """トレイメニューの「終了」：本当にアプリを終了する。"""
+        self._force_quit = True
+        self.close()
+
+    def _on_tab_changed(self, _index: int) -> None:
+        """アクティブタブが変わったら共有UI（サムネ/目次/状態）を同期する。"""
+        tab = self._active_tab()
+        if tab is None:
+            self.center.setCurrentWidget(self.welcome)
+            self._update_actions()
+            self._update_status()
+            self._update_title()
+            return
+        self.thumbnails.load(tab.doc)
+        self.toc_dock.load(tab.doc.get_toc())
+        self.thumbnails.select_page(tab.page_view.index)
+        # 整理トグルをこのタブの状態に同期
+        self.act_organize.blockSignals(True)
+        self.act_organize.setChecked(tab.currentWidget() is tab.organizer)
+        self.act_organize.blockSignals(False)
+        # 検索UIをこのタブに同期
+        self.search_edit.clear()
+        self._update_search_label()
+        self._update_actions()
+        self._update_status()
+        self._update_title()
+
+    def _close_tab(self, index: int) -> None:
+        tab = self.tabs.widget(index)
+        if not isinstance(tab, DocTab):
+            return
+        if tab.doc.is_open and tab.doc.modified:
+            self.tabs.setCurrentIndex(index)
+            ret = QMessageBox.question(
+                self, "未保存の変更",
+                f"「{self.tabs.tabText(index)}」に保存されていない変更があります。保存しますか？",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+            )
+            if ret == QMessageBox.StandardButton.Save:
+                self.save()
+                if tab.doc.modified:  # 保存がキャンセルされた等
+                    return
+            elif ret == QMessageBox.StandardButton.Cancel:
+                return
+        tab.doc.close()
+        self.tabs.removeTab(index)
+        tab.deleteLater()
+        if self.tabs.count() == 0:
+            self.center.setCurrentWidget(self.welcome)
+            self._update_actions()
+            self._update_title()
+
+    def _goto(self, index: int) -> None:
+        """サムネイルクリック等での明示的なページ移動（スクロールする）。"""
+        self.page_view.set_page(index)
+        self.thumbnails.select_page(self.page_view.index)
+        self._update_status()
+
+    def _on_page_changed(self, index: int) -> None:
+        """スクロールで表示ページが変わったときの追従（再スクロールはしない）。"""
+        self.thumbnails.select_page(index)
+        self._update_status()
+
+    def _fit(self) -> None:
+        self.page_view.fit_width()
+        self._update_status()
+
+    def _rotate(self, delta: int) -> None:
+        if not self.doc.is_open:
+            return
+        index = self.page_view.index
+        self.doc.rotate_page(index, delta)
+        self.page_view.refresh_page(index)
+        self.thumbnails.refresh_page(self.doc, index)
+        self._update_title()
+
+    # --- 注釈 ----------------------------------------------------------
+    def _on_tool_changed(self, action) -> None:
+        self.page_view.set_tool(action.data())
+        tool = action.data()
+        if tool == page_view.TOOL_NONE:
+            self.statusBar().clearMessage()
+        else:
+            self.statusBar().showMessage(
+                f"注釈ツール: {action.text()}（ページ上でドラッグ/クリック）", 0
+            )
+
+    def _pick_color(self) -> None:
+        col = QColorDialog.getColor(self._annot_color, self, "注釈の色")
+        if not col.isValid():
+            return
+        self._annot_color = col
+        self.page_view.set_color(col)
+        self._refresh_color_icon()
+        # 注釈を選択中なら、その色を変更する
+        if self.page_view.has_selection():
+            self.page_view.recolor_selection(col)
+
+    def _on_selection_changed(self, has: bool) -> None:
+        if has:
+            self.statusBar().showMessage(
+                "注釈を選択中：ドラッグで移動 / ダブルクリックで本文編集 / "
+                "色ボタンで色変更 / Delete で削除", 0
+            )
+        else:
+            self.statusBar().clearMessage()
+
+    def _clear_annots(self) -> None:
+        if not self.doc.is_open:
+            return
+        index = self.page_view.index
+        n = self.doc.clear_annots(index)
+        if n:
+            self.page_view.refresh_page(index)
+            self._update_title()
+            self.statusBar().showMessage(f"{n} 件の注釈を消去しました", 3000)
+        else:
+            self.statusBar().showMessage("このページに注釈はありません", 3000)
+
+    def _on_annotation_changed(self, index: int) -> None:
+        self._update_title()
+        self.thumbnails.refresh_page(self.doc, index)
+
+    # --- 墨消し / ページ操作 / 透かし / メタ / 抽出 -------------------
+    def _apply_redactions(self) -> None:
+        if not self.doc.is_open:
+            return
+        ret = QMessageBox.question(
+            self, "墨消しの適用",
+            "登録済みの墨消し範囲の文字・画像を完全に削除します。元に戻せません。続行しますか？",
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        self.page_view.apply_redactions()
+        self.thumbnails.load(self.doc)
+        self._update_title()
+        self.statusBar().showMessage("墨消しを適用しました", 3000)
+
+    def _insert_blank_page(self) -> None:
+        if not self.doc.is_open:
+            return
+        at = self.page_view.index + 1
+        self.doc.insert_blank_page(at)
+        self._reload(at)
+        self.statusBar().showMessage("白紙ページを挿入しました", 3000)
+
+    def _duplicate_page(self) -> None:
+        if not self.doc.is_open:
+            return
+        idx = self.page_view.index
+        self.doc.duplicate_page(idx)
+        self._reload(idx + 1)
+        self.statusBar().showMessage("ページを複製しました", 3000)
+
+    def _auto_crop_all(self) -> None:
+        if not self.doc.is_open:
+            return
+        n = 0
+        for i in range(self.doc.page_count):
+            rect = self.doc.auto_crop_rect(i)
+            if rect:
+                self.doc.set_crop(i, rect)
+                n += 1
+        self._reload(self.page_view.index)
+        self.statusBar().showMessage(f"{n} ページの余白をトリミングしました", 3000)
+
+    def add_watermark_dialog(self) -> None:
+        if not self.doc.is_open:
+            return
+        text, ok = QInputDialog.getText(self, "透かし", "透かし文字:", text="社外秘")
+        if not ok or not text.strip():
+            return
+        self.doc.add_watermark(text.strip())
+        self._reload(self.page_view.index)
+        self.statusBar().showMessage("透かしを追加しました", 3000)
+
+    def add_header_footer_dialog(self) -> None:
+        if not self.doc.is_open:
+            return
+        pos, ok = QInputDialog.getItem(
+            self, "ヘッダー/フッター", "位置:", ["フッター(下)", "ヘッダー(上)"], 0, False
+        )
+        if not ok:
+            return
+        hint = "左・中央・右をカンマ区切りで入力。{date} {filename} {page} {total} 使用可"
+        text, ok = QInputDialog.getText(
+            self, "内容", hint, text="{filename}, , {page}/{total}"
+        )
+        if not ok:
+            return
+        cells = [c.strip() for c in (text.split(",") + ["", "", ""])[:3]]
+        self.doc.add_header_footer(cells[0], cells[1], cells[2],
+                                   top=(pos == "ヘッダー(上)"))
+        self._reload(self.page_view.index)
+        self.statusBar().showMessage("ヘッダー/フッターを追加しました", 3000)
+
+    def edit_metadata_dialog(self) -> None:
+        if not self.doc.is_open:
+            return
+        meta = self.doc.get_metadata()
+        title, ok = QInputDialog.getText(self, "文書プロパティ", "タイトル:",
+                                         text=meta.get("title", "") or "")
+        if not ok:
+            return
+        author, ok = QInputDialog.getText(self, "文書プロパティ", "著者:",
+                                          text=meta.get("author", "") or "")
+        if not ok:
+            return
+        keywords, ok = QInputDialog.getText(self, "文書プロパティ", "キーワード:",
+                                            text=meta.get("keywords", "") or "")
+        if not ok:
+            return
+        meta.update(title=title, author=author, keywords=keywords)
+        self.doc.set_metadata(meta)
+        self._update_title()
+        self.statusBar().showMessage("メタデータを更新しました", 3000)
+
+    def _export_text(self, as_html: bool) -> None:
+        if not self.doc.is_open:
+            return
+        base = os.path.splitext(self.doc.path or "document")[0]
+        if as_html:
+            out, _ = QFileDialog.getSaveFileName(
+                self, "HTMLに書き出し", base + ".html", "HTML (*.html)")
+        else:
+            out, _ = QFileDialog.getSaveFileName(
+                self, "テキストに書き出し", base + ".txt", "テキスト (*.txt)")
+        if not out:
+            return
+        try:
+            if as_html:
+                self.doc.export_html(out)
+            else:
+                self.doc.export_text(out)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"書き出せませんでした:\n{exc}")
+            return
+        self.statusBar().showMessage(f"書き出しました: {out}", 4000)
+
+    # --- しおり / 目次 -------------------------------------------------
+    def _add_bookmark(self) -> None:
+        if not self.doc.is_open:
+            return
+        page1 = self.page_view.index + 1
+        title, ok = QInputDialog.getText(
+            self, "しおりを追加", "タイトル:", text=f"ページ {page1}"
+        )
+        if not ok or not title.strip():
+            return
+        self.doc.add_bookmark(title.strip(), page1)
+        self.toc_dock.load(self.doc.get_toc())
+        self._update_title()
+        self.statusBar().showMessage("しおりを追加しました", 3000)
+
+    def _edit_toc(self) -> None:
+        if not self.doc.is_open:
+            return
+        dlg = TocEditDialog(self.doc.get_toc(), self.doc.page_count, self)
+        if dlg.exec() == TocEditDialog.DialogCode.Accepted:
+            self.doc.set_toc(dlg.result_toc())
+            self.toc_dock.load(self.doc.get_toc())
+            self._update_title()
+            self.statusBar().showMessage("目次を更新しました", 3000)
+
+    # --- 検索 ----------------------------------------------------------
+    def _focus_search(self) -> None:
+        self.search_edit.setFocus()
+        self.search_edit.selectAll()
+
+    def _do_search(self) -> None:
+        if not self.doc.is_open:
+            return
+        query = self.search_edit.text().strip()
+        if not query:
+            self.page_view.clear_search()
+            self.search_count_label.setText("  0 件  ")
+            return
+        hits = self.doc.search(query)
+        self.page_view.set_search_results(hits)
+        self._update_search_label()
+        if not hits:
+            self.statusBar().showMessage(f"「{query}」は見つかりませんでした", 3000)
+
+    def _search_step(self, step: int) -> None:
+        if self.page_view.search_count() == 0:
+            return
+        self.page_view.goto_hit(self.page_view.search_current() + step)
+        self.thumbnails.select_page(self.page_view.index)
+        self._update_search_label()
+
+    def _update_search_label(self) -> None:
+        n = self.page_view.search_count()
+        if n == 0:
+            self.search_count_label.setText("  0 件  ")
+        else:
+            self.search_count_label.setText(
+                f"  {self.page_view.search_current() + 1} / {n} 件  "
+            )
+
+    def _highlight_all_hits(self) -> None:
+        if not self.doc.is_open:
+            return
+        hits = self.page_view._search_hits
+        if not hits:
+            self.statusBar().showMessage("先に検索してください", 3000)
+            return
+        c = self._annot_color
+        n = self.doc.add_search_highlights(
+            hits, (c.redF(), c.greenF(), c.blueF())
+        )
+        # 影響ページを再描画
+        for idx in {h[0] for h in hits}:
+            self.page_view.refresh_page(idx)
+            self.thumbnails.refresh_page(self.doc, idx)
+        self._update_title()
+        self.statusBar().showMessage(f"{n} 件をハイライトしました", 3000)
+
+    # --- パスワード保護 / 解除 ----------------------------------------
+    def protect_save(self) -> None:
+        if not self.doc.is_open:
+            return
+        pw, ok = QInputDialog.getText(
+            self, "パスワード保護", "設定するパスワード:", QLineEdit.EchoMode.Password
+        )
+        if not ok or not pw:
+            return
+        pw2, ok = QInputDialog.getText(
+            self, "パスワード確認", "もう一度入力:", QLineEdit.EchoMode.Password
+        )
+        if not ok:
+            return
+        if pw != pw2:
+            QMessageBox.warning(self, "不一致", "パスワードが一致しません")
+            return
+        base = os.path.splitext(self.doc.path or "document")[0]
+        out, _ = QFileDialog.getSaveFileName(
+            self, "保護して保存", base + "_protected.pdf", "PDF ファイル (*.pdf)"
+        )
+        if not out:
+            return
+        try:
+            self.doc.save_encrypted(out, pw)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"保護できませんでした:\n{exc}")
+            return
+        QMessageBox.information(self, "完了", f"AES-256 で保護して保存しました:\n{out}")
+
+    def unlock_save(self) -> None:
+        if not self.doc.is_open:
+            return
+        if not self.doc.is_encrypted:
+            QMessageBox.information(self, "情報", "このPDFは暗号化されていません")
+            return
+        base = os.path.splitext(self.doc.path or "document")[0]
+        out, _ = QFileDialog.getSaveFileName(
+            self, "解除して保存", base + "_unlocked.pdf", "PDF ファイル (*.pdf)"
+        )
+        if not out:
+            return
+        try:
+            self.doc.save_decrypted(out)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"解除できませんでした:\n{exc}")
+            return
+        QMessageBox.information(self, "完了", f"暗号化を解除して保存しました:\n{out}")
+
+    # --- テキストコピー ------------------------------------------------
+    def _copy_text(self) -> None:
+        if self.page_view.copy_selection():
+            self.statusBar().showMessage("選択テキストをコピーしました", 2000)
+
+    def _on_text_selection_changed(self, has: bool) -> None:
+        self.act_copy.setEnabled(has)
+        if has:
+            self.statusBar().showMessage(
+                "テキスト選択中：Ctrl+C または右クリック→コピー", 0
+            )
+        else:
+            self.statusBar().clearMessage()
+
+    # --- ズーム / 印刷 -------------------------------------------------
+    def _on_zoom_preset(self, _idx: int) -> None:
+        text = self.zoom_combo.currentText()
+        if text == "幅に合わせる":
+            self.page_view.fit_width()
+        else:
+            try:
+                self.page_view.set_zoom(int(text.rstrip("%")) / 100.0)
+            except ValueError:
+                pass
+
+    def _on_zoom_changed(self, zoom: float) -> None:
+        pct = int(round(zoom * 100))
+        self.zoom_slider.blockSignals(True)
+        self.zoom_slider.setValue(max(self.zoom_slider.minimum(),
+                                      min(pct, self.zoom_slider.maximum())))
+        self.zoom_slider.blockSignals(False)
+        self._update_status()
+
+    def _toggle_facing(self, on: bool) -> None:
+        self.page_view.set_facing(on)
+        self.page_view.fit_width()
+
+    def deskew_document(self) -> None:
+        if not self.doc.is_open:
+            return
+        ret = QMessageBox.question(
+            self, "傾き補正",
+            "スキャン（画像）ページの傾きを補正します。\n"
+            "対象ページは画像として作り直されます（テキストのあるページは変更しません）。続行しますか？",
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        dlg = QProgressDialog("傾き補正中…", "キャンセル", 0, self.doc.page_count, self)
+        dlg.setWindowTitle("傾き補正")
+        dlg.setMinimumDuration(0)
+
+        def progress(done, total):
+            dlg.setMaximum(total)
+            dlg.setValue(done)
+            QApplication.processEvents()
+            return not dlg.wasCanceled()
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            n = self.doc.deskew_all(progress=progress)
+        except Exception as exc:  # noqa: BLE001
+            dlg.close()
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "エラー", f"傾き補正に失敗:\n{exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        dlg.close()
+        if n < 0:
+            self.statusBar().showMessage("傾き補正をキャンセルしました", 3000)
+            return
+        self._reload(self.page_view.index)
+        self.thumbnails.load(self.doc)
+        self._update_title()
+        self.statusBar().showMessage(f"{n} ページの傾きを補正しました", 4000)
+
+    # --- バッチ処理 / 比較 ---------------------------------------------
+    def batch_dialog(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "処理する PDF を選択（複数可）", self._last_dir(), "PDF (*.pdf)"
+        )
+        if not paths:
+            return
+        op, ok = QInputDialog.getItem(
+            self, "バッチ処理", "操作:",
+            ["最適化(圧縮)", "各ページ画像化(PNG 150dpi)", "OCR(日本語+英語)"], 0, False
+        )
+        if not ok:
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, "出力先フォルダ")
+        if not out_dir:
+            return
+        tessdata = None
+        if op.startswith("OCR"):
+            try:
+                tessdata = ocr.ensure_languages(["jpn", "eng"])
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.critical(self, "エラー", f"OCR準備に失敗:\n{exc}")
+                return
+
+        dlg = QProgressDialog("バッチ処理中…", "キャンセル", 0, len(paths), self)
+        dlg.setWindowTitle("バッチ処理")
+        dlg.setMinimumDuration(0)
+        done, errors = 0, []
+        for n, p in enumerate(paths):
+            dlg.setValue(n)
+            dlg.setLabelText(f"{os.path.basename(p)} ({n + 1}/{len(paths)})")
+            QApplication.processEvents()
+            if dlg.wasCanceled():
+                break
+            stem = os.path.splitext(os.path.basename(p))[0]
+            try:
+                d = PdfDocument()
+                d.open(p)
+                if d.needs_password:
+                    d.close()
+                    errors.append(f"{stem}: パスワード保護のためスキップ")
+                    continue
+                if op.startswith("最適化"):
+                    d.compress_to(os.path.join(out_dir, f"{stem}_optimized.pdf"))
+                elif op.startswith("各ページ"):
+                    d.export_page_images(list(range(d.page_count)), out_dir,
+                                         "png", 150, stem)
+                else:  # OCR
+                    d.ocr_to(os.path.join(out_dir, f"{stem}_ocr.pdf"),
+                             "jpn+eng", tessdata, dpi=300)
+                d.close()
+                done += 1
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{stem}: {exc}")
+        dlg.setValue(len(paths))
+        msg = f"{done} 件を処理しました。\n出力先: {out_dir}"
+        if errors:
+            msg += "\n\n[スキップ/失敗]\n" + "\n".join(errors[:10])
+        QMessageBox.information(self, "バッチ処理 完了", msg)
+
+    def diff_dialog(self) -> None:
+        from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QPlainTextEdit,
+                                       QVBoxLayout)
+        import difflib
+        a, _ = QFileDialog.getOpenFileName(self, "比較するPDF①", self._last_dir(), "PDF (*.pdf)")
+        if not a:
+            return
+        b, _ = QFileDialog.getOpenFileName(self, "比較するPDF②", self._last_dir(), "PDF (*.pdf)")
+        if not b:
+            return
+
+        def text_of(path):
+            d = PdfDocument(); d.open(path)
+            if d.needs_password:
+                d.close()
+                raise RuntimeError("パスワード保護されています")
+            t = d.full_text(); d.close()
+            return t
+
+        try:
+            ta, tb = text_of(a), text_of(b)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"比較できませんでした:\n{exc}")
+            return
+        diff = list(difflib.unified_diff(
+            ta.splitlines(), tb.splitlines(),
+            fromfile=os.path.basename(a), tofile=os.path.basename(b), lineterm=""
+        ))
+        dlg = QDialog(self)
+        dlg.setWindowTitle("PDF テキスト比較")
+        dlg.resize(720, 560)
+        lay = QVBoxLayout(dlg)
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setStyleSheet("font-family: Consolas, monospace;")
+        view.setPlainText("\n".join(diff) if diff else "差分はありません（テキストは一致）。")
+        lay.addWidget(view)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        box.rejected.connect(dlg.reject)
+        box.accepted.connect(dlg.accept)
+        lay.addWidget(box)
+        dlg.exec()
+
+    def print_document(self) -> None:
+        if not self.doc.is_open:
+            return
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        if QPrintDialog(printer, self).exec() != QPrintDialog.DialogCode.Accepted:
+            return
+        from PySide6.QtGui import QPainter
+        painter = QPainter(printer)
+        page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
+        try:
+            for i in range(self.doc.page_count):
+                if i > 0:
+                    printer.newPage()
+                # 高解像度で描画した各ページをプリンタ面に合わせて配置
+                pix = self.doc.render_page(i, zoom=2.0)
+                scaled = pix.scaled(
+                    int(page_rect.width()), int(page_rect.height()),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                x = (page_rect.width() - scaled.width()) / 2
+                y = (page_rect.height() - scaled.height()) / 2
+                painter.drawPixmap(int(x), int(y), scaled)
+        finally:
+            painter.end()
+        self.statusBar().showMessage("印刷ジョブを送信しました", 3000)
+
+    # --- 設定の永続化 / 最近のファイル / D&D --------------------------
+    def _last_dir(self) -> str:
+        return self.settings.value("last_dir", "", str)
+
+    def _add_recent(self, path: str) -> None:
+        self.settings.setValue("last_dir", os.path.dirname(path))
+        recent = self.settings.value("recent", [], list) or []
+        recent = [p for p in recent if p != path]
+        recent.insert(0, path)
+        self.settings.setValue("recent", recent[:8])
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self) -> None:
+        self.recent_menu.clear()
+        recent = self.settings.value("recent", [], list) or []
+        for p in recent:
+            act = self.recent_menu.addAction(os.path.basename(p))
+            act.setData(p)
+            act.triggered.connect(lambda _c=False, path=p: self.open_path(path))
+        self.recent_menu.setEnabled(bool(recent))
+
+    def _restore_settings(self) -> None:
+        geo = self.settings.value("geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        dark = self.settings.value("dark", False, bool)
+        if dark:
+            self.act_dark.setChecked(True)  # toggled シグナルでテーマ適用
+        # キャンバス背景色を現在テーマに合わせる（ライト起動時も適用）
+        self.page_view.set_canvas_color(theme.canvas_color(dark))
+        if self.settings.value("compact", False, bool):
+            self.act_compact.setChecked(True)  # toggled で適用
+        # ツールバーの表示/非表示（折りたたみ）を復元
+        self.annot_toolbar.setVisible(self.settings.value("annot_bar", True, bool))
+        self.search_toolbar.setVisible(self.settings.value("search_bar", True, bool))
+        self._rebuild_recent_menu()
+
+    def _save_settings(self) -> None:
+        self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("dark", self.act_dark.isChecked())
+        self.settings.setValue("compact", self.act_compact.isChecked())
+        self.settings.setValue("annot_bar", self.annot_toolbar.isVisible())
+        self.settings.setValue("search_bar", self.search_toolbar.isVisible())
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls() and any(
+            u.toLocalFile().lower().endswith(".pdf") for u in event.mimeData().urls()
+        ):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        for u in event.mimeData().urls():
+            p = u.toLocalFile()
+            if p.lower().endswith(".pdf"):
+                self.open_path(p)
+                break
+
+    # --- 更新 / バージョン情報 ----------------------------------------
+    def show_about(self) -> None:
+        from . import updater
+        from .version import APP_VERSION
+
+        QMessageBox.information(
+            self, "バージョン情報",
+            f"PDF Editor\nバージョン {APP_VERSION}\n"
+            f"{'（凍結ビルド）' if updater.is_frozen() else '（ソース実行）'}",
+        )
+
+    def set_update_url(self) -> None:
+        from . import updater
+
+        cur = updater.manifest_url(self.settings)
+        url, ok = QInputDialog.getText(
+            self, "更新元URLを設定",
+            "update.json の公開URL（GitHub Releases 等）:", text=cur
+        )
+        if ok:
+            self.settings.setValue("update_url", url.strip())
+            self.statusBar().showMessage("更新元URLを保存しました", 3000)
+
+    def check_for_update(self) -> None:
+        from . import updater
+
+        if not updater.is_frozen():
+            QMessageBox.information(
+                self, "更新の確認",
+                "ソース実行では自動更新は不要です。\n"
+                "依存の更新は update.ps1（pip 更新＋再ビルド）をご利用ください。",
+            )
+            return
+        url = updater.manifest_url(self.settings)
+        if not url:
+            QMessageBox.information(
+                self, "更新元が未設定",
+                "更新元URLが設定されていません。\n"
+                "［ヘルプ > 更新元URLを設定］で update.json のURLを設定してください。",
+            )
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            info = updater.check(url)
+        except Exception as exc:  # noqa: BLE001
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "更新の確認", f"確認できませんでした:\n{exc}")
+            return
+        QApplication.restoreOverrideCursor()
+        if not info:
+            QMessageBox.information(self, "更新の確認", "お使いのバージョンは最新です。")
+            return
+
+        notes = info.get("notes", "")
+        ret = QMessageBox.question(
+            self, "更新があります",
+            f"新しいバージョン {info['version']} があります。\n\n{notes}\n\n"
+            "今すぐ更新しますか？（ダウンロード後、アプリを再起動します）",
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        dlg = QProgressDialog("ダウンロード中…", "キャンセル", 0, 100, self)
+        dlg.setWindowTitle("更新")
+        dlg.setMinimumDuration(0)
+
+        def progress(done, total):
+            if total > 0:
+                dlg.setValue(int(done * 100 / total))
+            QApplication.processEvents()
+            return not dlg.wasCanceled()
+
+        try:
+            zip_path = updater.download(info["url"], progress=progress)
+        except Exception as exc:  # noqa: BLE001
+            dlg.close()
+            QMessageBox.warning(self, "更新", f"ダウンロードに失敗しました:\n{exc}")
+            return
+        dlg.close()
+        # 改ざん検証（update.json に sha256 があれば照合）
+        if not updater.verify(zip_path, info.get("sha256", "")):
+            QMessageBox.critical(
+                self, "更新",
+                "ダウンロードしたファイルの検証(SHA256)に失敗しました。\n"
+                "更新を中止します。",
+            )
+            return
+        try:
+            updater.apply_and_restart(zip_path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "更新", f"更新の適用に失敗しました:\n{exc}")
+            return
+        QMessageBox.information(
+            self, "更新", "アプリを終了して更新を適用します。\n自動的に再起動します。"
+        )
+        QApplication.instance().quit()
+
+    # --- テーマ --------------------------------------------------------
+    def _toggle_dark(self, on: bool) -> None:
+        theme.apply_theme(QApplication.instance(), on)
+        canvas = theme.canvas_color(on)
+        # 全タブ＋予備ビューに反映
+        self._spare_view.set_canvas_color(canvas)
+        for i in range(self.tabs.count()):
+            t = self.tabs.widget(i)
+            if isinstance(t, DocTab):
+                t.page_view.set_canvas_color(canvas)
+                t.organizer.apply_theme(on)
+        self._assign_icons()  # 記号アイコンの色をテーマに追従させる
+
+    # --- ページ番号 ----------------------------------------------------
+    def add_page_numbers_dialog(self) -> None:
+        if not self.doc.is_open:
+            return
+        pos_map = {
+            "下中央": "bottom-center", "下右": "bottom-right", "下左": "bottom-left",
+            "上中央": "top-center", "上右": "top-right", "上左": "top-left",
+        }
+        pos_label, ok = QInputDialog.getItem(
+            self, "ページ番号", "位置:", list(pos_map.keys()), 0, False
+        )
+        if not ok:
+            return
+        fmt, ok = QInputDialog.getItem(
+            self, "ページ番号", "書式:",
+            ["{n}", "{n} / {total}", "- {n} -", "Page {n}"], 1, True
+        )
+        if not ok or "{n}" not in fmt:
+            if ok:
+                QMessageBox.information(self, "書式エラー", "{n} を含めてください")
+            return
+        start, ok = QInputDialog.getInt(
+            self, "ページ番号", "開始番号:", value=1, minValue=0
+        )
+        if not ok:
+            return
+        try:
+            self.doc.add_page_numbers(pos_map[pos_label], fmt, start=start)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"追加できませんでした:\n{exc}")
+            return
+        self.page_view.reload(self.page_view.index)
+        self.thumbnails.load(self.doc)
+        self._update_title()
+        self.statusBar().showMessage("ページ番号を追加しました", 3000)
+
+    # --- 最適化 / PDF-A ------------------------------------------------
+    def compress_save(self) -> None:
+        if not self.doc.is_open:
+            return
+        before = os.path.getsize(self.doc.path) if self.doc.path and os.path.exists(self.doc.path) else 0
+        base = os.path.splitext(self.doc.path or "document")[0]
+        out, _ = QFileDialog.getSaveFileName(
+            self, "最適化して保存", base + "_optimized.pdf", "PDF ファイル (*.pdf)"
+        )
+        if not out:
+            return
+        try:
+            self.doc.compress_to(out)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"最適化できませんでした:\n{exc}")
+            return
+        after = os.path.getsize(out)
+        msg = f"最適化して保存しました:\n{out}\n\nサイズ: {after:,} バイト"
+        if before:
+            msg += f"（元 {before:,} バイト / {100 * after // before}%）"
+        QMessageBox.information(self, "完了", msg)
+
+    def export_pdfa(self) -> None:
+        if not self.doc.is_open:
+            return
+        base = os.path.splitext(self.doc.path or "document")[0]
+        out, _ = QFileDialog.getSaveFileName(
+            self, "PDF/A で書き出し", base + "_pdfa.pdf", "PDF ファイル (*.pdf)"
+        )
+        if not out:
+            return
+        try:
+            self.doc.export_pdfa(out)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"PDF/A 化できませんでした:\n{exc}")
+            return
+        QMessageBox.information(
+            self, "PDF/A 完了",
+            f"PDF/A-2b として書き出しました:\n{out}\n\n"
+            "※ sRGB の OutputIntent と PDF/A 識別情報を付与しています。"
+            "厳密な準拠検証は専用バリデータの利用を推奨します。",
+        )
+
+    # --- ページ整理画面の切り替え -------------------------------------
+    def _toggle_organize(self, on: bool) -> None:
+        tab = self._active_tab()
+        if tab is None:
+            return
+        if on:
+            tab.organizer.load(tab.doc)
+            tab.setCurrentWidget(tab.organizer)
+        else:
+            tab.setCurrentWidget(tab.page_view)
+
+    def _jump_from_organizer(self, index: int) -> None:
+        """整理画面でダブルクリックされたページをビューワーで開く。"""
+        self.act_organize.setChecked(False)  # ビューワーへ戻す
+        self._goto(index)
+
+    # --- ページ編集（Step 3） ------------------------------------------
+    def _reload(self, target: int) -> None:
+        """ページ構成変更後に全ビュー（サイドバー・ビューワー・整理画面）を再構築。"""
+        self.thumbnails.load(self.doc)
+        self.page_view.reload(target)
+        self.organizer.load(self.doc)
+        self.thumbnails.select_page(self.page_view.index)
+        self._update_status()
+        self._update_title()
+
+    def _delete_page(self, index: int) -> None:
+        if not self.doc.is_open:
+            return
+        try:
+            self.doc.delete_page(index)
+        except ValueError as exc:
+            QMessageBox.information(self, "削除できません", str(exc))
+            return
+        self._reload(min(index, self.doc.page_count - 1))
+
+    def _delete_pages(self, indices: list) -> None:
+        if not self.doc.is_open or not indices:
+            return
+        try:
+            self.doc.delete_pages([int(i) for i in indices])
+        except ValueError as exc:
+            QMessageBox.information(self, "削除できません", str(exc))
+            return
+        self._reload(min(min(indices), self.doc.page_count - 1))
+
+    def _rotate_pages(self, indices: list, delta: int) -> None:
+        if not self.doc.is_open or not indices:
+            return
+        for i in indices:
+            self.doc.rotate_page(int(i), delta)
+        self._reload(self.page_view.index)
+
+    def _reorder(self, new_order: list) -> None:
+        if not self.doc.is_open:
+            return
+        # 並べ替え後に、元の表示ページがどこへ移ったかを追う
+        current = self.page_view.index
+        try:
+            target = new_order.index(current)
+        except ValueError:
+            target = 0
+        self.doc.reorder([int(x) for x in new_order])
+        self._reload(target)
+
+    def _reorder_from_organizer(self, new_order: list, new_selected: list) -> None:
+        """整理画面での並べ替え。再読み込み後に選択を復元し、連続操作できるようにする。"""
+        if not self.doc.is_open:
+            return
+        self.doc.reorder([int(x) for x in new_order])
+        # ビューワー側の現在ページは新しい位置へ追随
+        current = self.page_view.index
+        try:
+            target = new_order.index(current)
+        except ValueError:
+            target = 0
+        self._reload(target)
+        self.organizer.select_positions([int(p) for p in new_selected])
+
+    def merge_pdf(self) -> None:
+        if not self.doc.is_open:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "末尾に統合する PDF を選択", "", "PDF ファイル (*.pdf)"
+        )
+        if not path:
+            return
+        try:
+            self.doc.insert_pdf(path)  # 末尾に追加
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"統合できませんでした:\n{exc}")
+            return
+        self._reload(self.doc.page_count - 1)
+        self.statusBar().showMessage("PDF を末尾に統合しました", 3000)
+
+    def extract_pages(self) -> None:
+        if not self.doc.is_open:
+            return
+        text, ok = QInputDialog.getText(
+            self,
+            "ページ抽出",
+            "抽出するページ（例: 1-3,5,8）:",
+            text=f"{self.page_view.index + 1}",
+        )
+        if not ok or not text.strip():
+            return
+        try:
+            indices = _parse_ranges(text, self.doc.page_count)
+        except ValueError as exc:
+            QMessageBox.information(self, "入力エラー", str(exc))
+            return
+        self._extract_indices(indices)
+
+    def _extract_indices(self, indices: list) -> None:
+        """指定インデックス（0始まり）のページを別ファイルへ抽出する。"""
+        if not self.doc.is_open or not indices:
+            return
+        indices = [int(i) for i in indices]
+        out, _ = QFileDialog.getSaveFileName(
+            self, "抽出結果を保存", "extracted.pdf", "PDF ファイル (*.pdf)"
+        )
+        if not out:
+            return
+        try:
+            self.doc.extract_to(indices, out)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"抽出できませんでした:\n{exc}")
+            return
+        self.statusBar().showMessage(
+            f"{len(indices)} ページを抽出しました: {out}", 4000
+        )
+
+    def split_pdf(self) -> None:
+        if not self.doc.is_open:
+            return
+        n, ok = QInputDialog.getInt(
+            self, "PDF 分割", "何ページごとに分割しますか？", value=1, minValue=1
+        )
+        if not ok:
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, "出力先フォルダを選択")
+        if not out_dir:
+            return
+        stem = os.path.splitext(os.path.basename(self.doc.path or "split"))[0]
+        try:
+            outputs = self.doc.split_every(n, out_dir, stem)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"分割できませんでした:\n{exc}")
+            return
+        QMessageBox.information(
+            self, "分割完了", f"{len(outputs)} 個のファイルを出力しました。\n{out_dir}"
+        )
+
+    # --- 画像変換（Step 4） --------------------------------------------
+    def export_images_dialog(self) -> None:
+        """PDF→画像。ページ範囲を指定して書き出す（ツールバーから）。"""
+        if not self.doc.is_open:
+            return
+        text, ok = QInputDialog.getText(
+            self,
+            "画像に書き出し",
+            "対象ページ（例: 1-3,5 / 空欄で全ページ）:",
+            text=f"1-{self.doc.page_count}",
+        )
+        if not ok:
+            return
+        try:
+            indices = (
+                _parse_ranges(text, self.doc.page_count)
+                if text.strip()
+                else list(range(self.doc.page_count))
+            )
+        except ValueError as exc:
+            QMessageBox.information(self, "入力エラー", str(exc))
+            return
+        self._export_indices_images(indices)
+
+    def _export_indices_images(self, indices: list) -> None:
+        """指定ページを画像として書き出す（整理画面の選択からも呼ばれる）。"""
+        if not self.doc.is_open or not indices:
+            return
+        indices = [int(i) for i in indices]
+        fmt, ok = QInputDialog.getItem(
+            self, "形式", "画像形式:", ["PNG", "JPEG"], 0, False
+        )
+        if not ok:
+            return
+        dpi, ok = QInputDialog.getInt(
+            self, "解像度", "DPI（大きいほど高精細）:", value=150, minValue=36, maxValue=600
+        )
+        if not ok:
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, "出力先フォルダを選択")
+        if not out_dir:
+            return
+        stem = os.path.splitext(os.path.basename(self.doc.path or "page"))[0]
+        try:
+            outputs = self.doc.export_page_images(indices, out_dir, fmt, dpi, stem)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"書き出せませんでした:\n{exc}")
+            return
+        QMessageBox.information(
+            self, "完了", f"{len(outputs)} 枚の画像を出力しました。\n{out_dir}"
+        )
+
+    def images_to_pdf_dialog(self) -> None:
+        """画像→PDF。複数画像から新しい PDF を作る（開いていなくても可）。"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "PDF にする画像を選択（複数可）", "",
+            "画像 (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff)",
+        )
+        if not paths:
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, "保存先 PDF", "images.pdf", "PDF ファイル (*.pdf)"
+        )
+        if not out:
+            return
+        try:
+            PdfDocument.images_to_pdf(paths, out)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"作成できませんでした:\n{exc}")
+            return
+        ret = QMessageBox.question(
+            self, "完了", f"PDF を作成しました:\n{out}\n\n今すぐ開きますか？"
+        )
+        if ret == QMessageBox.StandardButton.Yes:
+            self.open_path(out)  # 新しいタブで開く
+
+    def add_images_as_pages(self) -> None:
+        """画像を現在の PDF にページとして取り込む。"""
+        if not self.doc.is_open:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "ページとして追加する画像を選択（複数可）", "",
+            "画像 (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff)",
+        )
+        if not paths:
+            return
+        try:
+            added = self.doc.insert_images_as_pages(paths)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"追加できませんでした:\n{exc}")
+            return
+        self._reload(self.doc.page_count - 1)
+        self.statusBar().showMessage(f"{added} ページ（画像）を追加しました", 3000)
+
+    # --- OCR（Step 5） --------------------------------------------------
+    def run_ocr(self) -> None:
+        """全ページを OCR し、検索可能 PDF を別名で書き出す。"""
+        if not self.doc.is_open:
+            return
+        labels = list(ocr.LANGUAGE_CHOICES.keys())
+        label, ok = QInputDialog.getItem(
+            self, "文字認識(OCR)", "認識する言語:", labels, 0, False
+        )
+        if not ok:
+            return
+        language = ocr.LANGUAGE_CHOICES[label]
+
+        # 必要な言語データを用意（不足分はダウンロード）
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            tessdata = ocr.ensure_languages(language.split("+"))
+        except Exception as exc:  # noqa: BLE001
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(
+                self, "OCR 準備エラー",
+                f"言語データを用意できませんでした:\n{exc}\n\n"
+                "ネットワーク接続をご確認ください。",
+            )
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        base = os.path.splitext(self.doc.path or "document")[0]
+        out, _ = QFileDialog.getSaveFileName(
+            self, "検索可能 PDF の保存先", base + "_ocr.pdf", "PDF ファイル (*.pdf)"
+        )
+        if not out:
+            return
+
+        dlg = QProgressDialog("OCR 処理中…", "キャンセル", 0, self.doc.page_count, self)
+        dlg.setWindowTitle("文字認識(OCR)")
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        def progress(done: int, total: int) -> bool:
+            dlg.setMaximum(total)
+            dlg.setValue(done)
+            dlg.setLabelText(f"OCR 処理中… {done}/{total} ページ")
+            QApplication.processEvents()
+            return not dlg.wasCanceled()
+
+        try:
+            done = self.doc.ocr_to(out, language, tessdata, dpi=300, progress=progress)
+        except Exception as exc:  # noqa: BLE001
+            dlg.close()
+            QMessageBox.critical(self, "OCR エラー", f"OCR に失敗しました:\n{exc}")
+            return
+        dlg.close()
+        if not done:
+            self.statusBar().showMessage("OCR をキャンセルしました", 3000)
+            return
+        ret = QMessageBox.question(
+            self, "OCR 完了",
+            f"検索可能 PDF を作成しました:\n{out}\n\n今すぐ開きますか？",
+        )
+        if ret == QMessageBox.StandardButton.Yes:
+            self.open_path(out)  # 新しいタブで開く
+
+    def save(self) -> None:
+        if not self.doc.is_open:
+            return
+        # Documents 配下などはフォルダー保護で上書きが弾かれることがあるため、
+        # 失敗したら名前を付けて保存にフォールバックする。
+        try:
+            self.doc.save()
+        except Exception as exc:  # noqa: BLE001
+            ret = QMessageBox.question(
+                self,
+                "上書きできません",
+                f"上書き保存に失敗しました:\n{exc}\n\n"
+                "別の場所に名前を付けて保存しますか？",
+            )
+            if ret == QMessageBox.StandardButton.Yes:
+                self.save_as()
+            return
+        self._update_title()
+        self.statusBar().showMessage("保存しました", 3000)
+
+    def save_as(self) -> None:
+        if not self.doc.is_open:
+            return
+        suggested = self.doc.path or "untitled.pdf"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "名前を付けて保存", suggested, "PDF ファイル (*.pdf)"
+        )
+        if not path:
+            return
+        try:
+            self.doc.save_as(path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"保存できませんでした:\n{exc}")
+            return
+        self.doc.path = path
+        tab = self._active_tab()
+        if tab is not None:
+            self.tabs.setTabToolTip(self.tabs.indexOf(tab), path)
+        self._update_title()
+        self.statusBar().showMessage(f"保存しました: {path}", 4000)
+
+    # --- 状態更新 -------------------------------------------------------
+    def _update_status(self) -> None:
+        if self.doc.is_open:
+            self.page_label.setText(
+                f"  ページ: {self.page_view.index + 1} / {self.doc.page_count}"
+                f"   ズーム: {self.page_view.zoom * 100:.0f}%  "
+            )
+        else:
+            self.page_label.setText("  ページ: - / -  ")
+
+    def _update_title(self) -> None:
+        tab = self._active_tab()
+        if tab is None:
+            self.setWindowTitle("PDF Editor")
+            return
+        name = os.path.basename(tab.doc.path) if tab.doc.path else "(無題)"
+        mark = "*" if tab.doc.modified else ""
+        self.setWindowTitle(f"PDF Editor — {mark}{name}")
+        # タブ見出しにも未保存マークを反映
+        idx = self.tabs.indexOf(tab)
+        if idx >= 0:
+            self.tabs.setTabText(idx, f"{mark}{name}")
+
+    def _update_actions(self) -> None:
+        has = self.doc.is_open
+        for act in (
+            self.act_prev,
+            self.act_next,
+            self.act_zoom_in,
+            self.act_zoom_out,
+            self.act_fit,
+            self.act_rotate_left,
+            self.act_rotate_right,
+            self.act_save,
+            self.act_save_as,
+            self.act_delete,
+            self.act_merge,
+            self.act_extract,
+            self.act_split,
+            self.act_organize,
+            self.act_to_images,
+            self.act_add_images,
+            self.act_ocr,
+            self.act_color,
+            self.act_clear_annots,
+            self.act_add_bookmark,
+            self.act_edit_toc,
+            self.act_compress,
+            self.act_export_pdfa,
+            self.act_page_numbers,
+            self.act_find,
+            self.act_search_next,
+            self.act_search_prev,
+            self.act_highlight_all,
+            self.act_protect,
+            self.act_unlock,
+            self.act_apply_redact,
+            self.act_blank_page,
+            self.act_duplicate_page,
+            self.act_autocrop,
+            self.act_watermark,
+            self.act_header_footer,
+            self.act_metadata,
+            self.act_export_text,
+            self.act_export_html,
+            self.act_print,
+            self.act_facing,
+            self.act_deskew,
+            *self.tool_group.actions(),
+        ):
+            act.setEnabled(has)
+        self.width_spin.setEnabled(has)
+        self.search_edit.setEnabled(has)
+        # 画像→PDF は PDF を開いていなくても使える
+        self.act_from_images.setEnabled(True)
+
+    # --- 終了確認 -------------------------------------------------------
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        # トレイ常駐が有効なら、閉じる代わりにトレイへ隠す（次回起動を高速化）
+        if not self._force_quit and self._tray_resident_enabled():
+            event.ignore()
+            self.hide()
+            if not self._tray_notified:
+                self._tray_notified = True
+                self.tray.showMessage(
+                    "PDF Editor",
+                    "トレイで実行中です。次回 PDF を開くとすぐに表示されます。\n"
+                    "完全に終了するにはトレイアイコンを右クリック →「終了」。",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    4000,
+                )
+            return
+
+        # --- 実終了処理 ---
+        # 未保存のタブがあれば確認
+        modified = [i for i in range(self.tabs.count())
+                    if isinstance(self.tabs.widget(i), DocTab)
+                    and self.tabs.widget(i).doc.is_open
+                    and self.tabs.widget(i).doc.modified]
+        if modified:
+            ret = QMessageBox.question(
+                self,
+                "未保存の変更",
+                f"{len(modified)} 個のタブに保存されていない変更があります。すべて保存しますか？",
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+            )
+            if ret == QMessageBox.StandardButton.Cancel:
+                self._force_quit = False  # 終了をキャンセル → 常駐継続
+                event.ignore()
+                return
+            if ret == QMessageBox.StandardButton.Save:
+                for i in modified:
+                    self.tabs.setCurrentIndex(i)
+                    self.save()
+        self._save_settings()
+        if getattr(self, "tray", None) is not None:
+            self.tray.hide()
+        event.accept()
+        QApplication.instance().quit()

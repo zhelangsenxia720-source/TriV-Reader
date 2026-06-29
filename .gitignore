@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller の作業物（出力は %USERPROFILE% 側だが念のため）
+build/
+dist/
+*.spec
+
+# 一時/生成物
+*.bak
+_sample.pdf
+_*.pdf
+tessdata/
+PDFEditor_data/
+PDFEditor.ini
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

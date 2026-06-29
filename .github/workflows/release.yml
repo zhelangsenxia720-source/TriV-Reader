@@ -1,0 +1,58 @@
+name: Build & Release
+
+# v1.2.3 のようなタグを push すると、クラウドで自動ビルド＆リリースします。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # リリース作成に必要
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: ソース取得
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 依存インストール
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: バージョンとタグの一致確認
+        shell: pwsh
+        run: |
+          $v = python -c "import sys; sys.path.insert(0,'.'); from viewer.version import APP_VERSION; print(APP_VERSION)"
+          if ("v$v" -ne "${{ github.ref_name }}") {
+            Write-Error "APP_VERSION ($v) がタグ (${{ github.ref_name }}) と一致しません。viewer/version.py を更新してください。"
+            exit 1
+          }
+
+      - name: ビルド（exe 化）
+        run: python build_exe.py
+
+      - name: zip / update.json 生成
+        run: >
+          python make_release.py
+          --base-url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+          --notes "${{ github.ref_name }}"
+
+      - name: GitHub リリース作成＆アップロード
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $rel = Join-Path $env:USERPROFILE "PDFEditor_release"
+          $zip = (Get-ChildItem (Join-Path $rel "PDFEditor-*.zip")).FullName
+          $json = Join-Path $rel "update.json"
+          gh release create "${{ github.ref_name }}" "$zip" "$json" `
+            --repo "${{ github.repository }}" `
+            --title "${{ github.ref_name }}" `
+            --notes "Release ${{ github.ref_name }}"

@@ -1,0 +1,1127 @@
+"""PDF ドキュメントのラッパ。
+
+レンダリングと情報取得を担当する。Step 1 では表示のみを扱い、
+編集・保存（回転の永続化など）は後続ステップで pikepdf を併用して実装する。
+"""
+from __future__ import annotations
+
+import os
+
+import fitz  # PyMuPDF
+from PySide6.QtGui import QImage, QPixmap
+
+
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+class PdfDocument:
+    """PyMuPDF の Document を薄くラップしたクラス。"""
+
+    def __init__(self) -> None:
+        self._doc: fitz.Document | None = None
+        self.path: str | None = None
+        self.modified: bool = False
+        self._authenticated: bool = True
+
+    # --- ライフサイクル -------------------------------------------------
+    def open(self, path: str, password: str | None = None) -> None:
+        self.close()
+        self._doc = fitz.open(path)
+        self.path = path
+        self.modified = False
+        self._authenticated = not self._doc.needs_pass
+        # 保持する doc には「正しいパスワードでのみ」authenticate する。
+        # 誤パスワードの照合は check_password（使い捨て）で行うこと。
+        if self._doc.needs_pass and password:
+            self.authenticate(password)
+
+    @property
+    def needs_password(self) -> bool:
+        # authenticate 後に needs_pass が下がらない版があるため自前フラグで判定
+        return bool(self._doc) and self._doc.needs_pass and not self._authenticated
+
+    @property
+    def is_encrypted(self) -> bool:
+        return bool(self._doc) and self._doc.is_encrypted
+
+    @staticmethod
+    def check_password(path: str, password: str) -> bool:
+        """使い捨ての複製でパスワードを照合する。
+
+        MuPDF は誤パスワードで authenticate すると「その時点で開いている」
+        暗号化 doc の復号が壊れる。そのため照合は使い捨てインスタンスで行い、
+        本体は「正しいパスワードが分かってから」開くこと（open_file 参照）。
+        """
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            tmp = fitz.open(stream=data, filetype="pdf")
+            ok = (not tmp.needs_pass) or tmp.authenticate(password) > 0
+            tmp.close()
+            return ok
+        except Exception:  # noqa: BLE001
+            return False
+
+    def authenticate(self, password: str) -> bool:
+        if not self._doc:
+            return False
+        ok = self._doc.authenticate(password) > 0
+        if ok:
+            self._authenticated = True
+        return ok
+
+    def close(self) -> None:
+        if self._doc is not None:
+            self._doc.close()
+            self._doc = None
+            self.path = None
+            self.modified = False
+
+    @property
+    def is_open(self) -> bool:
+        return self._doc is not None
+
+    @property
+    def page_count(self) -> int:
+        return self._doc.page_count if self._doc else 0
+
+    # --- サイズ ---------------------------------------------------------
+    def page_pixel_size(self, index: int, zoom: float) -> tuple[int, int]:
+        """指定ページを zoom 倍で描画したときの (幅, 高さ) px。
+
+        page.rect は回転を反映するため、そのまま zoom 倍すればよい
+        （連続スクロール表示のプレースホルダ確保に使う）。
+        """
+        if not self._doc:
+            return (0, 0)
+        rect = self._doc.load_page(index).rect
+        return (max(1, round(rect.width * zoom)), max(1, round(rect.height * zoom)))
+
+    # --- レンダリング ---------------------------------------------------
+    def render_page(self, index: int, zoom: float = 1.0) -> QPixmap:
+        """指定ページを zoom 倍で描画して QPixmap を返す。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        page = self._doc.load_page(index)
+        matrix = fitz.Matrix(zoom, zoom)
+        # alpha=False で不透明背景にする（白紙が透過にならない）
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        return self._pixmap_from_fitz(pix)
+
+    def render_thumbnail(self, index: int, max_width: int = 160) -> QPixmap:
+        """サムネイル用の小さな描画。横幅 max_width に合わせて縮小する。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        page = self._doc.load_page(index)
+        rect = page.rect
+        zoom = max_width / rect.width if rect.width else 1.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return self._pixmap_from_fitz(pix)
+
+    # --- 回転 -----------------------------------------------------------
+    def rotation(self, index: int) -> int:
+        """ページの現在の絶対回転角（0/90/180/270）。"""
+        if not self._doc:
+            return 0
+        return self._doc.load_page(index).rotation
+
+    def rotate_page(self, index: int, delta: int) -> int:
+        """ページを delta 度（±90 など）相対回転し、新しい絶対角を返す。
+
+        PyMuPDF 上で set_rotation するとメモリ上の表示に反映される。
+        実ファイルへの永続化は save / save_as で標準の /Rotate に書き込む。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        page = self._doc.load_page(index)
+        new_angle = (page.rotation + delta) % 360
+        page.set_rotation(new_angle)
+        self.modified = True
+        return new_angle
+
+    # --- 注釈（標準 PDF アノテーション） ------------------------------
+    def label_to_pdf_point(self, index: int, x: float, y: float, zoom: float):
+        """表示(ラベル)座標を、回転を考慮して unrotated PDF 座標へ変換する。"""
+        page = self._doc.load_page(index)
+        return fitz.Point(x / zoom, y / zoom) * page.derotation_matrix
+
+    def label_to_pdf_rect(self, index, x0, y0, x1, y1, zoom):
+        """表示座標の2点から PDF 座標の正規化済み矩形を作る。"""
+        page = self._doc.load_page(index)
+        m = page.derotation_matrix
+        p0 = fitz.Point(x0 / zoom, y0 / zoom) * m
+        p1 = fitz.Point(x1 / zoom, y1 / zoom) * m
+        r = fitz.Rect(p0, p1)
+        r.normalize()
+        return r
+
+    def add_highlight(self, index, rect, color=(1.0, 0.86, 0.18)) -> None:
+        page = self._doc.load_page(index)
+        annot = page.add_highlight_annot(rect)
+        annot.set_colors(stroke=color)
+        annot.update()
+        self.modified = True
+
+    def add_text_highlight(self, index, p0, p1, color=(1.0, 0.86, 0.18)) -> bool:
+        """p0→p1（PDF座標）の間にある文字を、語のquadに沿ってハイライトする。
+
+        テキストが見つからなければ False を返す（呼び出し側で矩形ハイライトに
+        フォールバックできる）。読み取り順で開始語〜終了語を選択する。
+        """
+        page = self._doc.load_page(index)
+        words = page.get_text("words")  # (x0,y0,x1,y1, word, block, line, word_no)
+        if not words:
+            return False
+        ordered = sorted(words, key=lambda w: (w[5], w[6], w[7]))
+
+        def nearest_index(pt):
+            best, bi = None, 0
+            for i, w in enumerate(ordered):
+                cx = (w[0] + w[2]) / 2
+                cy = (w[1] + w[3]) / 2
+                dist = abs(cx - pt.x) + abs(cy - pt.y)
+                if best is None or dist < best:
+                    best, bi = dist, i
+            return bi
+
+        i0, i1 = nearest_index(p0), nearest_index(p1)
+        if i0 > i1:
+            i0, i1 = i1, i0
+        quads = [fitz.Rect(w[:4]).quad for w in ordered[i0:i1 + 1]]
+        if not quads:
+            return False
+        annot = page.add_highlight_annot(quads)
+        annot.set_colors(stroke=color)
+        annot.update()
+        self.modified = True
+        return True
+
+    def add_rect(self, index, rect, color=(0.9, 0.1, 0.1), width=1.5) -> None:
+        page = self._doc.load_page(index)
+        annot = page.add_rect_annot(rect)
+        annot.set_colors(stroke=color)
+        annot.set_border(width=width)
+        annot.update()
+        self.modified = True
+
+    def add_ink(self, index, strokes, color=(0.9, 0.1, 0.1), width=2.0) -> None:
+        """strokes: PDF 座標の点列のリスト（[[Point or (x,y), ...], ...]）。"""
+        page = self._doc.load_page(index)
+        # add_ink_annot は「float ペアの列の列」を要求するため変換する
+        norm = [[(float(p.x), float(p.y)) if hasattr(p, "x") else (float(p[0]), float(p[1]))
+                 for p in stroke] for stroke in strokes]
+        annot = page.add_ink_annot(norm)
+        annot.set_colors(stroke=color)
+        annot.set_border(width=width)
+        annot.update()
+        self.modified = True
+
+    def add_freetext(self, index, rect, text, color=(0.0, 0.0, 0.0),
+                     fontsize=12, fontname="helv") -> None:
+        page = self._doc.load_page(index)
+        annot = page.add_freetext_annot(
+            rect, text, fontsize=fontsize, fontname=fontname, text_color=color
+        )
+        annot.update()
+        self.modified = True
+
+    def add_text_note(self, index, point, text, icon="Note") -> None:
+        """付箋（テキスト注釈）。point は PDF 座標。"""
+        page = self._doc.load_page(index)
+        annot = page.add_text_annot(point, text, icon=icon)
+        annot.update()
+        self.modified = True
+
+    # --- 追加の注釈種類（下線・取消線・直線・矢印・円） ---------------
+    def add_underline(self, index, p0, p1, color=(0.1, 0.3, 0.9)) -> bool:
+        """p0→p1 の文字に下線を引く（文字が無ければ False）。"""
+        return self._text_markup(index, p0, p1, "underline", color)
+
+    def add_strikeout(self, index, p0, p1, color=(0.9, 0.1, 0.1)) -> bool:
+        """p0→p1 の文字に取り消し線を引く（文字が無ければ False）。"""
+        return self._text_markup(index, p0, p1, "strikeout", color)
+
+    def _text_markup(self, index, p0, p1, kind, color) -> bool:
+        _text, rects = self.select_text(index, p0, p1)
+        if not rects:
+            return False
+        page = self._doc.load_page(index)
+        quads = [r.quad for r in rects]
+        if kind == "underline":
+            annot = page.add_underline_annot(quads)
+        else:
+            annot = page.add_strikeout_annot(quads)
+        annot.set_colors(stroke=color)
+        annot.update()
+        self.modified = True
+        return True
+
+    def add_line(self, index, p0, p1, color=(0.9, 0.1, 0.1), width=2.0,
+                 arrow=False) -> None:
+        """直線（arrow=True で終端を矢印に）。p0,p1 は PDF 座標。"""
+        page = self._doc.load_page(index)
+        annot = page.add_line_annot(p0, p1)
+        annot.set_colors(stroke=color)
+        annot.set_border(width=width)
+        if arrow:
+            annot.set_line_ends(fitz.PDF_ANNOT_LE_NONE, fitz.PDF_ANNOT_LE_CLOSED_ARROW)
+        annot.update()
+        self.modified = True
+
+    def add_circle(self, index, rect, color=(0.9, 0.1, 0.1), width=2.0) -> None:
+        """楕円/円の注釈。"""
+        page = self._doc.load_page(index)
+        annot = page.add_circle_annot(rect)
+        annot.set_colors(stroke=color)
+        annot.set_border(width=width)
+        annot.update()
+        self.modified = True
+
+    # --- 墨消し（Redaction：データごと削除） --------------------------
+    def add_redaction(self, index, rect, fill=(0, 0, 0)) -> None:
+        """墨消し対象を登録する（まだ削除はしない）。apply_redactions で確定。"""
+        page = self._doc.load_page(index)
+        page.add_redact_annot(rect, fill=fill)
+        self.modified = True
+
+    def apply_redactions(self) -> int:
+        """登録済みの墨消しを全ページに適用し、対象の文字/画像を完全削除する。"""
+        if not self._doc:
+            return 0
+        n = 0
+        for i in range(self.page_count):
+            page = self._doc.load_page(i)
+            applied = page.apply_redactions()
+            # apply_redactions の戻りは版により bool/None。件数は annots から数える。
+            n += 1 if applied else 0
+        self.modified = True
+        return n
+
+    def pending_redactions(self, index: int) -> int:
+        """そのページの未適用の墨消し注釈数。"""
+        page = self._doc.load_page(index)
+        return sum(1 for a in page.annots(types=(fitz.PDF_ANNOT_REDACT,)))
+
+    @staticmethod
+    def _font_for(text: str) -> str:
+        """日本語等の非ASCIIを含むなら内蔵CJKフォント、無ければ Helvetica。"""
+        return "japan" if any(ord(c) > 0x7F for c in text) else "helv"
+
+    # --- 透かし / ヘッダー・フッター ----------------------------------
+    def add_watermark(self, text, fontsize=48, color=(0.5, 0.5, 0.5),
+                      opacity=0.3, angle=45) -> int:
+        """全ページの中央に半透明の透かし文字を斜めに重ねる。"""
+        if not self._doc:
+            return 0
+        font = self._font_for(text)
+        for i in range(self.page_count):
+            page = self._doc.load_page(i)
+            rect = page.rect
+            tw = fitz.get_text_length(text, fontname=font, fontsize=fontsize)
+            center = fitz.Point(rect.width / 2, rect.height / 2)
+            point = fitz.Point(center.x - tw / 2, center.y)
+            matrix = fitz.Matrix(angle)  # 中心まわりに回転
+            page.insert_text(point, text, fontsize=fontsize, fontname=font,
+                             color=color, fill_opacity=opacity,
+                             morph=(center, matrix))
+        self.modified = True
+        return self.page_count
+
+    def add_header_footer(self, left="", center="", right="", top=False,
+                          fontsize=10, color=(0, 0, 0), margin=28) -> int:
+        """各ページの上端/下端の左・中央・右にテキストを入れる。
+
+        {date} {filename} {page} {total} を差し込み可能。
+        """
+        if not self._doc:
+            return 0
+        import datetime
+        today = datetime.date.today().isoformat()
+        fname = os.path.basename(self.path) if self.path else ""
+        total = self.page_count
+        for i in range(total):
+            page = self._doc.load_page(i)
+            rect = page.rect
+            y = (margin + fontsize) if top else (rect.height - margin)
+            ctx = {"date": today, "filename": fname,
+                   "page": str(i + 1), "total": str(total)}
+            for text, where in ((left, "l"), (center, "c"), (right, "r")):
+                if not text:
+                    continue
+                s = text.format(**ctx)
+                font = self._font_for(s)
+                tw = fitz.get_text_length(s, fontname=font, fontsize=fontsize)
+                if where == "l":
+                    x = margin
+                elif where == "r":
+                    x = rect.width - margin - tw
+                else:
+                    x = (rect.width - tw) / 2
+                page.insert_text((x, y), s, fontsize=fontsize,
+                                 fontname=font, color=color)
+        self.modified = True
+        return total
+
+    # --- ページ操作（白紙挿入・複製・トリミング） ---------------------
+    def insert_blank_page(self, at: int, width=None, height=None) -> None:
+        """at の位置に白紙ページを挿入。サイズ未指定は隣ページ or A4。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        if width is None or height is None:
+            ref = min(max(at - 1, 0), self.page_count - 1) if self.page_count else 0
+            if self.page_count:
+                r = self._doc.load_page(ref).rect
+                width, height = r.width, r.height
+            else:
+                width, height = 595, 842
+        self._doc.new_page(pno=at, width=width, height=height)
+        self.modified = True
+
+    def duplicate_page(self, index: int) -> None:
+        """index ページを複製して直後に挿入する（独立コピー）。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        self._doc.fullcopy_page(index, index + 1)
+        self.modified = True
+
+    def set_crop(self, index: int, rect) -> None:
+        """表示/出力範囲(CropBox)を設定する。rect は PDF 座標。"""
+        page = self._doc.load_page(index)
+        page.set_cropbox(rect)
+        self.modified = True
+
+    def auto_crop_rect(self, index: int, margin=4.0):
+        """ページ内の文字・図形の外接矩形＋余白を返す（自動トリミング候補）。"""
+        page = self._doc.load_page(index)
+        bbox = None
+        for w in page.get_text("words"):
+            r = fitz.Rect(w[:4])
+            bbox = r if bbox is None else (bbox | r)
+        if bbox is None:
+            return None
+        bbox = fitz.Rect(bbox.x0 - margin, bbox.y0 - margin,
+                         bbox.x1 + margin, bbox.y1 + margin) & page.rect
+        return bbox
+
+    # --- メタデータ ----------------------------------------------------
+    def get_metadata(self) -> dict:
+        return dict(self._doc.metadata) if self._doc else {}
+
+    def set_metadata(self, meta: dict) -> None:
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        self._doc.set_metadata(meta)
+        self.modified = True
+
+    def clear_metadata(self) -> None:
+        """タイトル/著者等のメタデータを一括削除（プライバシー）。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        self._doc.set_metadata({})
+        self.modified = True
+
+    # --- 全文抽出 / HTML 書き出し -------------------------------------
+    def export_text(self, out_path: str) -> None:
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        parts = []
+        for i in range(self.page_count):
+            parts.append(self._doc.load_page(i).get_text())
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\f".join(parts))  # ページ区切りは改ページ文字
+
+    def export_html(self, out_path: str) -> None:
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        body = []
+        for i in range(self.page_count):
+            body.append(self._doc.load_page(i).get_text("html"))
+        html = ("<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
+                "<body>" + "\n".join(body) + "</body></html>")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+    def full_text(self) -> str:
+        if not self._doc:
+            return ""
+        return "\n".join(self._doc.load_page(i).get_text()
+                         for i in range(self.page_count))
+
+    def annot_count(self, index: int) -> int:
+        page = self._doc.load_page(index)
+        return sum(1 for _ in page.annots())
+
+    # --- 注釈の選択・移動・編集 ---------------------------------------
+    def annot_at(self, index, point):
+        """指定 PDF 座標を含む最前面の注釈の xref を返す（無ければ None）。"""
+        page = self._doc.load_page(index)
+        hit = None
+        for annot in page.annots():
+            if point in annot.rect:
+                hit = annot.xref  # 後勝ち＝最前面
+        return hit
+
+    def annot_rect(self, index, xref):
+        """注釈の矩形（PDF 座標）。"""
+        page = self._doc.load_page(index)  # page はこの関数内で生かし続ける
+        annot = self._find_on(page, xref)
+        return fitz.Rect(annot.rect) if annot else None
+
+    def annot_text(self, index, xref) -> str:
+        page = self._doc.load_page(index)
+        annot = self._find_on(page, xref)
+        return annot.info.get("content", "") if annot else ""
+
+    def annot_is_textual(self, index, xref) -> bool:
+        page = self._doc.load_page(index)
+        annot = self._find_on(page, xref)
+        return bool(annot) and annot.type[1] in ("FreeText", "Text")
+
+    def pdf_rect_to_label(self, index, rect, zoom):
+        """PDF 矩形を表示(ラベル)座標の (x0,y0,x1,y1) に変換する。"""
+        page = self._doc.load_page(index)
+        m = page.rotation_matrix
+        p0 = fitz.Point(rect.x0, rect.y0) * m
+        p1 = fitz.Point(rect.x1, rect.y1) * m
+        xs = sorted([p0.x * zoom, p1.x * zoom])
+        ys = sorted([p0.y * zoom, p1.y * zoom])
+        return (xs[0], ys[0], xs[1], ys[1])
+
+    @staticmethod
+    def _find_on(page, xref):
+        for annot in page.annots():
+            if annot.xref == xref:
+                return annot
+        return None
+
+    def _describe(self, annot) -> dict:
+        colors = annot.colors or {}
+        return {
+            "kind": annot.type[1],
+            "rect": fitz.Rect(annot.rect),
+            "vertices": annot.vertices,
+            "stroke": colors.get("stroke") or (0.0, 0.0, 0.0),
+            "width": (annot.border or {}).get("width", 1.5) or 1.5,
+            "content": annot.info.get("content", ""),
+        }
+
+    def _recreate(self, page, desc, dx=0.0, dy=0.0, color=None, width=None,
+                  text=None, new_rect=None):
+        """捕捉した注釈情報から、平行移動・リサイズ・色/太さ/本文変更して作り直す。
+
+        page は呼び出し側が delete に使ったのと同一の Page オブジェクトを渡す
+        （別インスタンスを混在させると PyMuPDF がクラッシュするため）。
+        new_rect 指定時はリサイズ（Ink は点列を旧矩形→新矩形へスケール）。
+        """
+        kind = desc["kind"]
+        stroke = color if color is not None else desc["stroke"]
+        w = width if width is not None else desc["width"]
+        content = text if text is not None else desc["content"]
+        old = desc["rect"]
+        if new_rect is not None:
+            target = fitz.Rect(new_rect)
+        else:
+            target = fitz.Rect(old.x0 + dx, old.y0 + dy, old.x1 + dx, old.y1 + dy)
+
+        if kind == "Highlight":
+            annot = page.add_highlight_annot(target)
+            annot.set_colors(stroke=stroke)
+        elif kind == "Square":
+            annot = page.add_rect_annot(target)
+            annot.set_colors(stroke=stroke)
+            annot.set_border(width=w)
+        elif kind == "FreeText":
+            annot = page.add_freetext_annot(target, content, fontsize=12, text_color=stroke)
+        elif kind == "Text":
+            annot = page.add_text_annot(fitz.Point(target.x0, target.y0), content)
+        elif kind == "Ink":
+            annot = page.add_ink_annot(self._map_ink(desc["vertices"], old, target))
+            annot.set_colors(stroke=stroke)
+            annot.set_border(width=w)
+        else:
+            return None
+        annot.update()
+        self.modified = True
+        return annot.xref
+
+    @staticmethod
+    def _map_ink(vertices, old, target):
+        """Ink の点列を旧矩形 old から新矩形 target へ平行移動＋スケールする。"""
+        ow = old.width or 1.0
+        oh = old.height or 1.0
+        sx = target.width / ow
+        sy = target.height / oh
+        out = []
+        for stroke_pts in (vertices or []):
+            out.append([
+                (target.x0 + (p[0] - old.x0) * sx, target.y0 + (p[1] - old.y0) * sy)
+                for p in stroke_pts
+            ])
+        return out
+
+    def _edit_annot(self, index, xref, **kwargs):
+        """同一 Page 上で注釈を捕捉→削除→再作成する共通処理。"""
+        page = self._doc.load_page(index)
+        annot = self._find_on(page, xref)
+        if not annot:
+            return None
+        desc = self._describe(annot)
+        page.delete_annot(annot)
+        return self._recreate(page, desc, **kwargs)
+
+    def delete_annot_xref(self, index, xref) -> bool:
+        """xref 指定で注釈を削除する。"""
+        page = self._doc.load_page(index)
+        annot = self._find_on(page, xref)
+        if annot is None:
+            return False
+        page.delete_annot(annot)
+        self.modified = True
+        return True
+
+    def move_annot(self, index, xref, dx, dy):
+        """注釈を (dx,dy) PDF 単位で平行移動。新しい xref を返す。"""
+        return self._edit_annot(index, xref, dx=dx, dy=dy)
+
+    def resize_annot(self, index, xref, new_rect):
+        """注釈を new_rect（PDF座標）にリサイズする。"""
+        return self._edit_annot(index, xref, new_rect=new_rect)
+
+    def recolor_annot(self, index, xref, color):
+        return self._edit_annot(index, xref, color=color)
+
+    def set_annot_text(self, index, xref, text):
+        return self._edit_annot(index, xref, text=text)
+
+    def delete_annot_at(self, index, point) -> bool:
+        """指定 PDF 座標を含む最前面の注釈を1つ削除する。"""
+        page = self._doc.load_page(index)
+        target = None
+        for annot in page.annots():
+            if point in annot.rect:
+                target = annot  # 後勝ち＝最前面
+        if target is not None:
+            page.delete_annot(target)
+            self.modified = True
+            return True
+        return False
+
+    def clear_annots(self, index: int) -> int:
+        page = self._doc.load_page(index)
+        annots = list(page.annots())
+        for annot in annots:
+            page.delete_annot(annot)
+        if annots:
+            self.modified = True
+        return len(annots)
+
+    # --- ページ編集（並べ替え・削除・統合） ---------------------------
+    def move_page(self, src: int, dst: int) -> None:
+        """src ページを dst の位置へ移動（並べ替え）。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        if src == dst:
+            return
+        # move_page は dst の「前」に挿入する。末尾へ送る場合に対応する。
+        self._doc.move_page(src, dst if dst < self.page_count else -1)
+        self.modified = True
+
+    def reorder(self, new_order: list[int]) -> None:
+        """new_order（旧インデックスの並び）の順にページを並べ替える。
+
+        全ページを過不足なく含むこと。fitz の select はこの配列の順序で
+        ページを取り直すため、並べ替えがそのまま反映される。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        if sorted(new_order) != list(range(self.page_count)):
+            raise ValueError("並べ替え指定が不正です")
+        self._doc.select(new_order)
+        self.modified = True
+
+    def delete_page(self, index: int) -> None:
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        if self.page_count <= 1:
+            raise ValueError("最後の1ページは削除できません")
+        self._doc.delete_page(index)
+        self.modified = True
+
+    def delete_pages(self, indices: list[int]) -> None:
+        """複数ページをまとめて削除する（順序は維持）。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        drop = set(indices)
+        keep = [i for i in range(self.page_count) if i not in drop]
+        if not keep:
+            raise ValueError("すべてのページは削除できません")
+        self._doc.select(keep)
+        self.modified = True
+
+    def insert_pdf(self, other_path: str, at: int | None = None) -> int:
+        """別の PDF を取り込む。at=None なら末尾に追加。挿入したページ数を返す。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        with fitz.open(other_path) as other:
+            n = other.page_count
+            start_at = self.page_count if at is None else at
+            self._doc.insert_pdf(other, start_at=start_at)
+        self.modified = True
+        return n
+
+    def insert_images_as_pages(
+        self, image_paths: list[str], at: int | None = None
+    ) -> int:
+        """画像ファイルをページとして取り込む。挿入したページ数を返す。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        start = self.page_count if at is None else at
+        added = 0
+        for p in image_paths:
+            with fitz.open(p) as img_doc:
+                pdf_bytes = img_doc.convert_to_pdf()
+            with fitz.open("pdf", pdf_bytes) as img_pdf:
+                self._doc.insert_pdf(img_pdf, start_at=start + added)
+                added += img_pdf.page_count
+        self.modified = True
+        return added
+
+    # --- 画像変換 -------------------------------------------------------
+    def export_page_images(
+        self,
+        indices: list[int],
+        out_dir: str,
+        fmt: str = "png",
+        dpi: int = 150,
+        stem: str = "page",
+    ) -> list[str]:
+        """指定ページを画像（PNG/JPEG）として書き出す。生成パス一覧を返す。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        ext = fmt.lower().lstrip(".")
+        if ext in ("jpg", "jpeg"):
+            ext = "jpg"
+        elif ext != "png":
+            raise ValueError("対応形式は PNG / JPEG です")
+        zoom = dpi / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        outputs: list[str] = []
+        for i in indices:
+            page = self._doc.load_page(i)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            out_path = os.path.join(out_dir, f"{stem}_{i + 1:03d}.{ext}")
+            pix.save(out_path)
+            outputs.append(out_path)
+        return outputs
+
+    def deskew_all(self, dpi: int = 200, limit: float = 8.0,
+                   skip_text_pages: bool = True, progress=None) -> int:
+        """スキャンページの傾きを補正する。補正したページ数を返す。
+
+        - テキストを持つページ（born-digital）は触らず原本を保持
+        - 画像/スキャンページは傾き角を推定し、補正画像で作り直す
+        progress(done, total) が False を返したら中断（変更は破棄）。
+        """
+        import io
+
+        from PIL import Image
+
+        from . import deskew as deskew_mod
+
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        new = fitz.open()
+        corrected = 0
+        total = self.page_count
+        try:
+            for i in range(total):
+                page = self._doc.load_page(i)
+                if skip_text_pages and page.get_text().strip():
+                    new.insert_pdf(self._doc, from_page=i, to_page=i)
+                else:
+                    pix = page.get_pixmap(dpi=dpi, alpha=False)
+                    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                    angle = deskew_mod.estimate_skew(img, limit=limit)
+                    if abs(angle) >= 0.2:
+                        img = img.rotate(angle, resample=Image.Resampling.BICUBIC,
+                                         fillcolor=(255, 255, 255), expand=False)
+                        corrected += 1
+                    buf = io.BytesIO()
+                    img.save(buf, format="png")
+                    with fitz.open("png", buf.getvalue()) as imgdoc:
+                        with fitz.open("pdf", imgdoc.convert_to_pdf()) as ip:
+                            new.insert_pdf(ip)
+                if progress and not progress(i + 1, total):
+                    new.close()
+                    return -1  # 中断
+        except Exception:
+            new.close()
+            raise
+        # 元ドキュメントを差し替える
+        self._doc.close()
+        self._doc = new
+        self.modified = True
+        return corrected
+
+    @staticmethod
+    def images_to_pdf(image_paths: list[str], out_path: str) -> None:
+        """画像ファイル群から 1 つの PDF を作成する（各画像=1ページ）。"""
+        if not image_paths:
+            raise ValueError("画像が指定されていません")
+        new = fitz.open()
+        try:
+            for p in image_paths:
+                with fitz.open(p) as img_doc:
+                    pdf_bytes = img_doc.convert_to_pdf()
+                with fitz.open("pdf", pdf_bytes) as img_pdf:
+                    new.insert_pdf(img_pdf)
+            new.save(out_path)
+        finally:
+            new.close()
+
+    # --- OCR（文字認識：透明テキスト層を付与） -----------------------
+    def ocr_to(
+        self,
+        out_path: str,
+        language: str,
+        tessdata: str,
+        dpi: int = 300,
+        skip_text_pages: bool = True,
+        progress=None,
+    ) -> bool:
+        """全ページを OCR し、検索可能 PDF を out_path に保存する。
+
+        - 既にテキストを持つページは（skip_text_pages 時）再OCRせず原本を保持
+        - 画像/スキャンページは dpi で描画し、透明テキスト層付き PDF に変換
+        - PyMuPDF(MuPDF) 内蔵の Tesseract を使うため、生成物は標準の検索可能PDF
+        progress(done, total) が False を返したらキャンセルして False を返す。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        new = fitz.open()
+        try:
+            total = self.page_count
+            for i in range(total):
+                page = self._doc.load_page(i)
+                if skip_text_pages and page.get_text().strip():
+                    new.insert_pdf(self._doc, from_page=i, to_page=i)
+                else:
+                    pix = page.get_pixmap(dpi=dpi)
+                    pdf_bytes = pix.pdfocr_tobytes(
+                        language=language, tessdata=tessdata
+                    )
+                    with fitz.open("pdf", pdf_bytes) as opdf:
+                        new.insert_pdf(opdf)
+                if progress and not progress(i + 1, total):
+                    return False  # キャンセル
+            new.save(out_path, garbage=4, deflate=True)
+        finally:
+            new.close()
+        return True
+
+    # --- 抽出・分割（新しいファイルを書き出す） -----------------------
+    def extract_to(self, indices: list[int], out_path: str) -> None:
+        """指定ページ（0始まり・任意の順序）だけを新しい PDF として保存。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        new = fitz.open()
+        try:
+            for i in indices:
+                new.insert_pdf(self._doc, from_page=i, to_page=i)
+            new.save(out_path, garbage=4, deflate=True)
+        finally:
+            new.close()
+
+    def split_every(self, n: int, out_dir: str, stem: str) -> list[str]:
+        """n ページごとに分割して複数ファイルを書き出す。生成パス一覧を返す。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        if n < 1:
+            raise ValueError("分割単位は1以上にしてください")
+        outputs: list[str] = []
+        total = self.page_count
+        part = 1
+        for start in range(0, total, n):
+            end = min(start + n - 1, total - 1)
+            out_path = os.path.join(out_dir, f"{stem}_part{part:02d}.pdf")
+            new = fitz.open()
+            try:
+                new.insert_pdf(self._doc, from_page=start, to_page=end)
+                new.save(out_path, garbage=4, deflate=True)
+            finally:
+                new.close()
+            outputs.append(out_path)
+            part += 1
+        return outputs
+
+    # --- 保存（標準準拠・回転や編集を反映） ---------------------------
+    def save_as(self, out_path: str) -> None:
+        """現在のドキュメント（回転・並べ替え・削除・統合を反映）を保存する。
+
+        PyMuPDF の save は /Rotate を標準どおり書き出すため、Adobe 以外の
+        どのビューワーでも同じ表示になる。garbage=4 で不要オブジェクトを
+        整理し、deflate で未圧縮ストリームのみ圧縮する（既存画像は再圧縮しない）。
+        開いているファイル自身へ上書きする場合は一時ファイル経由で置き換える。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        opening_self = self.path and _same_path(self.path, out_path)
+        if opening_self:
+            tmp = out_path + ".tmp_save"
+            self._doc.save(tmp, garbage=4, deflate=True)
+            self._doc.close()
+            os.replace(tmp, out_path)
+            self._doc = fitz.open(out_path)  # 置き換え後に開き直す
+        else:
+            self._doc.save(out_path, garbage=4, deflate=True)
+        self.path = out_path
+        self.modified = False
+
+    def save(self) -> None:
+        """元のファイルに上書き保存する。"""
+        if not self.path:
+            raise RuntimeError("保存先が不明です")
+        self.save_as(self.path)
+
+    # --- パスワード保護 / 解除 ----------------------------------------
+    def save_encrypted(self, out_path: str, user_pw: str, owner_pw: str | None = None) -> None:
+        """AES-256 でパスワード保護して別名保存する。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        if self.path and _same_path(self.path, out_path):
+            raise ValueError("開いているファイルとは別名で保存してください")
+        self._doc.save(
+            out_path,
+            encryption=fitz.PDF_ENCRYPT_AES_256,
+            owner_pw=owner_pw or user_pw,
+            user_pw=user_pw,
+            permissions=-1,  # すべて許可（印刷/コピー/抽出が制限されないように）
+            garbage=3,
+            deflate=True,
+        )
+
+    def save_decrypted(self, out_path: str) -> None:
+        """暗号化を解除して別名保存する（認証済みであること）。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        if self.path and _same_path(self.path, out_path):
+            raise ValueError("開いているファイルとは別名で保存してください")
+        self._doc.save(
+            out_path, encryption=fitz.PDF_ENCRYPT_NONE, garbage=3, deflate=True
+        )
+
+    # --- 検索 -----------------------------------------------------------
+    def search(self, query: str, max_hits: int = 2000) -> list:
+        """全ページから query を検索し [(page_index, fitz.Rect), ...] を返す。"""
+        if not self._doc or not query:
+            return []
+        results = []
+        for i in range(self.page_count):
+            page = self._doc.load_page(i)
+            for rect in page.search_for(query):
+                results.append((i, fitz.Rect(rect)))
+                if len(results) >= max_hits:
+                    return results
+        return results
+
+    def _page_chars(self, index):
+        """ページの文字を読み取り順で [(rect, char, line_id), ...] にする。"""
+        page = self._doc.load_page(index)
+        raw = page.get_text("rawdict")
+        chars = []
+        line_id = 0
+        for block in raw.get("blocks", []):
+            if block.get("type", 0) != 0:  # 0 = テキストブロックのみ
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    for ch in span.get("chars", []):
+                        chars.append((fitz.Rect(ch["bbox"]), ch["c"], line_id))
+                line_id += 1
+        return chars
+
+    def select_text(self, index, p0, p1):
+        """p0→p1（PDF座標）の間を「文字単位」で選択する。
+
+        返り値 (text, rects)。text は選択文字列（行が変わると改行）、
+        rects は行ごとにまとめた矩形（PDF座標、描画用）。テキストが無ければ ("", [])。
+        クリック位置が文字の左右どちら寄りかでキャレット位置を決め、横方向も正確に。
+        """
+        if not self._doc:
+            return ("", [])
+        chars = self._page_chars(index)
+        if not chars:
+            return ("", [])
+
+        def caret(pt):
+            # 行(Y)を重視して最寄りの文字を選び、左右半分でキャレット位置を決める
+            best, bi = None, 0
+            for i, (r, _c, _lid) in enumerate(chars):
+                cy = (r.y0 + r.y1) / 2
+                cx = (r.x0 + r.x1) / 2
+                score = abs(cy - pt.y) * 3 + abs(cx - pt.x)
+                if best is None or score < best:
+                    best, bi = score, i
+            r = chars[bi][0]
+            mid = (r.x0 + r.x1) / 2
+            return bi + 1 if pt.x > mid else bi  # 右半分なら文字の後ろ
+
+        c0, c1 = caret(p0), caret(p1)
+        if c0 > c1:
+            c0, c1 = c1, c0
+        sel = chars[c0:c1]
+        if not sel:
+            return ("", [])
+
+        text_parts, rects = [], []
+        cur, prev_line = None, None
+        for r, c, lid in sel:
+            if prev_line is not None and lid != prev_line:
+                text_parts.append("\n")
+                if cur is not None:
+                    rects.append(cur)
+                cur = None
+            text_parts.append(c)
+            cur = fitz.Rect(r) if cur is None else (cur | r)
+            prev_line = lid
+        if cur is not None:
+            rects.append(cur)
+        return ("".join(text_parts), rects)
+
+    def add_search_highlights(self, hits: list, color=(1.0, 0.86, 0.18)) -> int:
+        """検索ヒット [(page_index, rect), ...] をまとめてハイライト注釈にする。"""
+        if not self._doc:
+            return 0
+        for index, rect in hits:
+            page = self._doc.load_page(index)
+            annot = page.add_highlight_annot(rect)
+            annot.set_colors(stroke=color)
+            annot.update()
+        if hits:
+            self.modified = True
+        return len(hits)
+
+    # --- ページ番号（標準テキストとして焼き込み） ---------------------
+    def add_page_numbers(self, position="bottom-center", fmt="{n}",
+                         start=1, fontsize=11, margin=36, color=(0, 0, 0)) -> int:
+        """各ページにページ番号を挿入する。fmt は {n} と {total} が使える。
+
+        位置: bottom/top の center/right/left の組み合わせ。
+        本文テキストとして埋め込むため、どのビューワーでも表示される。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        total = self.page_count
+        for i in range(total):
+            page = self._doc.load_page(i)
+            text = fmt.format(n=start + i, total=total)
+            rect = page.rect
+            w, h = rect.width, rect.height
+            font = self._font_for(text)
+            tw = fitz.get_text_length(text, fontname=font, fontsize=fontsize)
+            if "right" in position:
+                x = w - margin - tw
+            elif "left" in position:
+                x = margin
+            else:  # center
+                x = (w - tw) / 2
+            y = (margin + fontsize) if "top" in position else (h - margin)
+            page.insert_text((x, y), text, fontsize=fontsize, color=color, fontname=font)
+        self.modified = True
+        return total
+
+    # --- しおり / 目次（標準アウトライン） ----------------------------
+    def get_toc(self) -> list:
+        """[[level, title, page(1始まり)], ...] を返す。"""
+        if not self._doc:
+            return []
+        return self._doc.get_toc(simple=True)
+
+    def set_toc(self, toc: list) -> None:
+        """目次（アウトライン）を設定する。標準PDFのしおりとして保存される。"""
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        self._doc.set_toc(toc)
+        self.modified = True
+
+    def add_bookmark(self, title: str, page1: int, level: int = 1) -> None:
+        """末尾にしおりを1件追加（page1 は1始まり）。"""
+        toc = self.get_toc()
+        toc.append([max(1, level), title, page1])
+        self.set_toc(toc)
+
+    # --- 最適化（無劣化圧縮） -----------------------------------------
+    def compress_to(self, out_path: str) -> None:
+        """不要オブジェクト整理＋ストリーム/フォント/画像の deflate で軽量化保存。
+
+        既存の JPEG 等は再圧縮しない（無劣化）。構造の冗長を除いてサイズを縮める。
+        """
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        kwargs = dict(garbage=4, deflate=True, deflate_images=True,
+                      deflate_fonts=True, clean=True)
+        if self.path and _same_path(self.path, out_path):
+            tmp = out_path + ".tmp_save"
+            self._doc.save(tmp, **kwargs)
+            self._doc.close()
+            os.replace(tmp, out_path)
+            self._doc = fitz.open(out_path)
+            self.path = out_path
+            self.modified = False
+        else:
+            self._doc.save(out_path, **kwargs)
+
+    # --- PDF/A-2b 化（pikepdf で OutputIntent + XMP 付与） -------------
+    SRGB_ICC = r"C:\Windows\System32\spool\drivers\color\sRGB Color Space Profile.icm"
+
+    def export_pdfa(self, out_path: str) -> None:
+        """PDF/A-2b 化して書き出す。
+
+        Ghostscript を使わず pikepdf で sRGB の OutputIntent と PDF/A 識別用 XMP を
+        付与する。完全準拠はフォント埋め込み等にも依存するため、厳密な検証は
+        別途バリデータ推奨（基本的な PDF/A 構造は満たす）。
+        """
+        import pikepdf
+
+        if not self._doc:
+            raise RuntimeError("ドキュメントが開かれていません")
+        if not os.path.exists(self.SRGB_ICC):
+            raise RuntimeError("sRGB ICC プロファイルが見つかりません")
+
+        # 現在の内容（注釈・回転等を反映）を一時PDFへ
+        tmp = out_path + ".pre_pdfa"
+        self._doc.save(tmp, garbage=4, deflate=True)
+        try:
+            with pikepdf.open(tmp) as pdf:
+                with open(self.SRGB_ICC, "rb") as f:
+                    icc = f.read()
+                icc_stream = pdf.make_stream(icc)
+                icc_stream.N = 3  # sRGB = 3 成分
+                oi = pdf.make_indirect(pikepdf.Dictionary(
+                    Type=pikepdf.Name.OutputIntent,
+                    S=pikepdf.Name("/GTS_PDFA1"),
+                    OutputConditionIdentifier=pikepdf.String("sRGB IEC61966-2.1"),
+                    Info=pikepdf.String("sRGB IEC61966-2.1"),
+                    DestOutputProfile=icc_stream,
+                ))
+                pdf.Root.OutputIntents = pikepdf.Array([oi])
+                with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+                    meta["pdfaid:part"] = "2"
+                    meta["pdfaid:conformance"] = "B"
+                pdf.save(out_path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    @staticmethod
+    def _pixmap_from_fitz(pix: "fitz.Pixmap") -> QPixmap:
+        image = QImage(
+            pix.samples,
+            pix.width,
+            pix.height,
+            pix.stride,
+            QImage.Format.Format_RGB888,
+        )
+        # QImage は元バッファを参照するため copy() で実体を確保する
+        return QPixmap.fromImage(image.copy())
