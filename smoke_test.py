@@ -28,7 +28,7 @@ def build_sample_pdf(path: str) -> None:
 def main() -> int:
     app = QApplication(sys.argv)  # noqa: F841  QPixmap に必要
     # Documents 配下は Windows のフォルダー保護で書込不可のことがあるため temp を使う
-    sample = os.path.join(tempfile.gettempdir(), "_pdfeditor_sample.pdf")
+    sample = os.path.join(tempfile.gettempdir(), "_trivreader_sample.pdf")
     build_sample_pdf(sample)
 
     doc = PdfDocument()
@@ -48,7 +48,7 @@ def main() -> int:
 
     doc.rotate_page(0, 90)
     doc.rotate_page(1, -90)  # = 270
-    out = os.path.join(tempfile.gettempdir(), "_pdfeditor_rotated.pdf")
+    out = os.path.join(tempfile.gettempdir(), "_trivreader_rotated.pdf")
     doc.save_as(out)
     doc.close()
 

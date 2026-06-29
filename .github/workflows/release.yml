@@ -54,8 +54,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $rel = Join-Path $env:USERPROFILE "PDFEditor_release"
-          $zip = (Get-ChildItem (Join-Path $rel "PDFEditor-*.zip")).FullName
+          $rel = Join-Path $env:USERPROFILE "TriVReader_release"
+          $zip = (Get-ChildItem (Join-Path $rel "TriVReader-*.zip")).FullName
           $json = Join-Path $rel "update.json"
           gh release create "${{ github.ref_name }}" "$zip" "$json" `
             --repo "${{ github.repository }}" `

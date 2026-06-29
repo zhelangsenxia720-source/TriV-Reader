@@ -86,7 +86,7 @@ class DocTab(QStackedWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("PDF Editor")
+        self.setWindowTitle("TriV-Reader")
         self.resize(1180, 820)
         self.setAcceptDrops(True)
         from . import storage
@@ -468,7 +468,7 @@ class MainWindow(QMainWindow):
         if self.is_lite:
             self.act_ocr.setVisible(False)
             self.act_deskew.setVisible(False)
-            self.setWindowTitle("PDF Editor (Lite)")
+            self.setWindowTitle("TriV-Reader (Lite)")
 
     def _polish_actions(self) -> None:
         """各アクションにツールチップ/ステータスヒントを付ける（ショートカット併記）。"""
@@ -767,7 +767,7 @@ class MainWindow(QMainWindow):
         if icon.isNull():
             icon = QApplication.windowIcon()
         self.tray = QSystemTrayIcon(icon, self)
-        self.tray.setToolTip("PDF Editor")
+        self.tray.setToolTip("TriV-Reader")
         menu = QMenu()
         act_show = menu.addAction("ウィンドウを表示")
         act_show.triggered.connect(self._show_from_tray)
@@ -1447,7 +1447,7 @@ class MainWindow(QMainWindow):
 
         QMessageBox.information(
             self, "バージョン情報",
-            f"PDF Editor\nバージョン {APP_VERSION}\n"
+            f"TriV-Reader\nバージョン {APP_VERSION}\n"
             f"{'（凍結ビルド）' if updater.is_frozen() else '（ソース実行）'}",
         )
 
@@ -1994,11 +1994,11 @@ class MainWindow(QMainWindow):
     def _update_title(self) -> None:
         tab = self._active_tab()
         if tab is None:
-            self.setWindowTitle("PDF Editor")
+            self.setWindowTitle("TriV-Reader")
             return
         name = os.path.basename(tab.doc.path) if tab.doc.path else "(無題)"
         mark = "*" if tab.doc.modified else ""
-        self.setWindowTitle(f"PDF Editor — {mark}{name}")
+        self.setWindowTitle(f"TriV-Reader — {mark}{name}")
         # タブ見出しにも未保存マークを反映
         idx = self.tabs.indexOf(tab)
         if idx >= 0:
@@ -2066,7 +2066,7 @@ class MainWindow(QMainWindow):
             if not self._tray_notified:
                 self._tray_notified = True
                 self.tray.showMessage(
-                    "PDF Editor",
+                    "TriV-Reader",
                     "トレイで実行中です。次回 PDF を開くとすぐに表示されます。\n"
                     "完全に終了するにはトレイアイコンを右クリック →「終了」。",
                     QSystemTrayIcon.MessageIcon.Information,

@@ -6,7 +6,7 @@ update.json の "url" に、update.json の公開URLをアプリの「更新元U
 
 使い方:
     python make_release.py [onedirフォルダ] [--base-url https://.../download] [--notes "説明"]
-    省略時は %USERPROFILE%\\PDFEditor_dist\\dist\\PDFEditor を対象にする。
+    省略時は %USERPROFILE%\\TriVReader_dist\\dist\\TriVReader を対象にする。
 """
 from __future__ import annotations
 
@@ -45,15 +45,15 @@ def main() -> int:
             folder = args[i]; i += 1
 
     if folder is None:
-        folder = os.path.join(os.path.expanduser("~"), "PDFEditor_dist", "dist", "PDFEditor")
+        folder = os.path.join(os.path.expanduser("~"), "TriVReader_dist", "dist", "TriVReader")
     if not os.path.isdir(folder):
         print("onedir フォルダが見つかりません:", folder, file=sys.stderr)
         print("先に build_exe.py でビルドするか、フォルダパスを指定してください。", file=sys.stderr)
         return 1
 
-    out_dir = os.path.join(os.path.expanduser("~"), "PDFEditor_release")
+    out_dir = os.path.join(os.path.expanduser("~"), "TriVReader_release")
     os.makedirs(out_dir, exist_ok=True)
-    zip_name = f"PDFEditor-{APP_VERSION}.zip"
+    zip_name = f"TriVReader-{APP_VERSION}.zip"
     zip_path = os.path.join(out_dir, zip_name)
 
     print("zip 作成中:", zip_path)
@@ -62,7 +62,7 @@ def main() -> int:
         for root, _dirs, files in os.walk(folder):
             for name in files:
                 full = os.path.join(root, name)
-                z.write(full, os.path.relpath(full, base))  # 先頭に PDFEditor/ を含める
+                z.write(full, os.path.relpath(full, base))  # 先頭に TriVReader/ を含める
 
     digest = _sha256(zip_path)
     tag = f"v{APP_VERSION}"

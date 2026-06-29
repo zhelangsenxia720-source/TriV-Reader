@@ -1,4 +1,4 @@
-# PDF Editor
+# TriV-Reader
 
 PySide6 + PyMuPDF 製の自作 PDF ビューワー / エディタ（Windows）。
 

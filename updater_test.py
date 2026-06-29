@@ -24,7 +24,7 @@ def main() -> int:
 
     # --- ダミーの新バージョン zip を作る ---------------------------
     exe_name = os.path.basename(sys.executable)  # テスト環境では python.exe
-    stage = os.path.join(TMP, "_upd_stage", "PDFEditor")
+    stage = os.path.join(TMP, "_upd_stage", "TriVReader")
     os.makedirs(stage, exist_ok=True)
     with open(os.path.join(stage, exe_name), "w") as f:
         f.write("dummy exe")
@@ -32,8 +32,8 @@ def main() -> int:
         f.write("payload")
     zip_path = os.path.join(TMP, "_upd_new.zip")
     with zipfile.ZipFile(zip_path, "w") as z:
-        z.write(os.path.join(stage, exe_name), f"PDFEditor/{exe_name}")
-        z.write(os.path.join(stage, "data.txt"), "PDFEditor/data.txt")
+        z.write(os.path.join(stage, exe_name), f"TriVReader/{exe_name}")
+        z.write(os.path.join(stage, "data.txt"), "TriVReader/data.txt")
 
     # --- update.json を file:// で配信して check() --------------------
     manifest = {"version": "9.9.9", "url": Path(zip_path).as_uri(), "notes": "テスト更新"}
@@ -70,9 +70,9 @@ def main() -> int:
     # --- GITHUB_REPO からの URL 組み立て ----------------------------
     from viewer import version as ver
     old = ver.GITHUB_REPO
-    ver.GITHUB_REPO = "yamada/pdfeditor"
+    ver.GITHUB_REPO = "yamada/trivreader"
     assert updater.manifest_url() == \
-        "https://github.com/yamada/pdfeditor/releases/latest/download/update.json"
+        "https://github.com/yamada/trivreader/releases/latest/download/update.json"
     ver.GITHUB_REPO = old
     print("OK: GITHUB_REPO から更新元URLを生成")
 

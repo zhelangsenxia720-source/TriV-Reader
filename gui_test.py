@@ -24,7 +24,7 @@ def build_sample(path: str, pages: int = 6) -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
-    sample = os.path.join(tempfile.gettempdir(), "_pdfeditor_scroll.pdf")
+    sample = os.path.join(tempfile.gettempdir(), "_trivreader_scroll.pdf")
     build_sample(sample, pages=6)
 
     w = MainWindow()

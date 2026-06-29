@@ -28,7 +28,7 @@ class WelcomeWidget(QWidget):
         logo.setStyleSheet("font-size: 56px;")
         lay.addWidget(logo)
 
-        title = QLabel("PDF Editor")
+        title = QLabel("TriV-Reader")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet("font-size: 24px; font-weight: 700;")
         lay.addWidget(title)

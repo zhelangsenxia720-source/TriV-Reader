@@ -49,11 +49,11 @@ def main() -> int:
 
     py = sys.executable
     home = os.path.expanduser("~")
-    name = "PDFEditor_Lite" if lite else "PDFEditor"
-    out_root = os.path.join(home, "PDFEditor_Lite_dist" if lite else "PDFEditor_dist")
+    name = "TriVReader_Lite" if lite else "TriVReader"
+    out_root = os.path.join(home, "TriVReader_Lite_dist" if lite else "TriVReader_dist")
     folder = os.path.join(out_root, "dist", name)
-    rel_dir = os.path.join(home, "PDFEditor_release")
-    zip_path = os.path.join(rel_dir, f"PDFEditor-{APP_VERSION}.zip")
+    rel_dir = os.path.join(home, "TriVReader_release")
+    zip_path = os.path.join(rel_dir, f"TriVReader-{APP_VERSION}.zip")
     manifest = os.path.join(rel_dir, "update.json")
     tag = f"v{APP_VERSION}"
 

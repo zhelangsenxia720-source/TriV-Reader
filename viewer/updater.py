@@ -4,7 +4,7 @@
 ダウンロード→展開→アプリフォルダを入れ替え→再起動する。
 
 凍結 exe は自分自身を上書きできないため、アプリ終了後に置換するヘルパー
-バッチ(.cmd)をデタッチ起動して実現する。ユーザーデータ（PDFEditor_data,
+バッチ(.cmd)をデタッチ起動して実現する。ユーザーデータ（TriVReader_data,
 *.ini マーカー）は保持する。
 """
 from __future__ import annotations
@@ -52,7 +52,7 @@ def check(url: str, timeout: int = 10) -> dict | None:
     """update.json を取得。新しい版があれば dict、無ければ None。"""
     if not url:
         return None
-    req = urllib.request.Request(url, headers={"User-Agent": "PDFEditor-Updater"})
+    req = urllib.request.Request(url, headers={"User-Agent": "TriVReader-Updater"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     if data.get("version") and is_newer(data["version"]):
@@ -62,7 +62,7 @@ def check(url: str, timeout: int = 10) -> dict | None:
 
 def download(url: str, progress=None) -> str:
     """zip をダウンロードして一時パスを返す。progress(done,total)->bool で中断可。"""
-    dst = os.path.join(tempfile.gettempdir(), "pdfeditor_update.zip")
+    dst = os.path.join(tempfile.gettempdir(), "trivreader_update.zip")
 
     def _hook(block, blocksize, total):
         if progress:
@@ -70,7 +70,7 @@ def download(url: str, progress=None) -> str:
             if not progress(min(done, total) if total > 0 else done, total):
                 raise RuntimeError("キャンセルされました")
 
-    req = urllib.request.Request(url, headers={"User-Agent": "PDFEditor-Updater"})
+    req = urllib.request.Request(url, headers={"User-Agent": "TriVReader-Updater"})
     with urllib.request.urlopen(req) as resp, open(dst, "wb") as f:
         total = int(resp.headers.get("Content-Length", 0))
         done = 0
@@ -104,7 +104,7 @@ def verify(path: str, expected: str) -> bool:
 
 def _extract(zip_path: str) -> str:
     """zip を展開し、exe を含むフォルダ（新バージョン一式）のパスを返す。"""
-    out = os.path.join(tempfile.gettempdir(), "pdfeditor_update_extract")
+    out = os.path.join(tempfile.gettempdir(), "trivreader_update_extract")
     if os.path.isdir(out):
         import shutil
         shutil.rmtree(out, ignore_errors=True)
@@ -128,7 +128,7 @@ def apply_and_restart(zip_path: str) -> None:
     app_dir = storage.base_dir()
     exe_path = sys.executable
     pid = os.getpid()
-    helper = os.path.join(tempfile.gettempdir(), "pdfeditor_update.cmd")
+    helper = os.path.join(tempfile.gettempdir(), "trivreader_update.cmd")
 
     # robocopy /E: 上書きコピー（/MIR と違い既存のユーザーデータを消さない）
     # /XD: ユーザーデータフォルダ除外、 /XF: マーカー/設定の保持
@@ -141,7 +141,7 @@ if not errorlevel 1 (
   timeout /t 1 /nobreak >nul
   goto waitloop
 )
-robocopy "{src_dir}" "{app_dir}" /E /NFL /NDL /NJH /NJS /NP /R:3 /W:1 /XD "PDFEditor_data" /XF "portable.ini" "lite.ini" "PDFEditor.ini" >nul
+robocopy "{src_dir}" "{app_dir}" /E /NFL /NDL /NJH /NJS /NP /R:3 /W:1 /XD "TriVReader_data" /XF "portable.ini" "lite.ini" "TriVReader.ini" >nul
 start "" "{exe_path}"
 del "%~f0"
 """

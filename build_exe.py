@@ -1,4 +1,4 @@
-"""PDF Editor を単体の .exe にビルドする（PyInstaller）。
+"""TriV-Reader を単体の .exe にビルドする（PyInstaller）。
 
 使い方:
     python build_exe.py            # 既定の出力先にビルド
@@ -8,10 +8,10 @@
     # 併用可: python build_exe.py --lite --portable
 
 出力:
-    <出力先>/PDFEditor/PDFEditor.exe   （onedir, 既定）
-    <出力先>/PDFEditor.exe             （--onefile 指定時）
+    <出力先>/TriVReader/TriVReader.exe   （onedir, 既定）
+    <出力先>/TriVReader.exe             （--onefile 指定時）
 
-既定の出力先は %USERPROFILE%\\PDFEditor_dist です。
+既定の出力先は %USERPROFILE%\\TriVReader_dist です。
 （プロジェクトが Documents 配下だとフォルダー保護で書き込めないため外に出力）
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def make_icon(path: str) -> None:
-    """アプリ用 .ico を生成する（青角丸＋PDF）。"""
+    """アプリ用 .ico を生成する（青角丸＋TR）。"""
     from PIL import Image, ImageDraw, ImageFont
 
     sizes = [256, 128, 64, 48, 32, 16]
@@ -34,7 +34,7 @@ def make_icon(path: str) -> None:
         font = ImageFont.truetype("arialbd.ttf", 76)
     except Exception:  # noqa: BLE001
         font = ImageFont.load_default()
-    text = "PDF"
+    text = "TR"
     box = d.textbbox((0, 0), text, font=font)
     tw, th = box[2] - box[0], box[3] - box[1]
     d.text(((256 - tw) / 2 - box[0], (256 - th) / 2 - box[1]), text,
@@ -45,14 +45,14 @@ def make_icon(path: str) -> None:
 def main() -> int:
     onefile = "--onefile" in sys.argv
     lite = "--lite" in sys.argv
-    name = "PDFEditor_Lite" if lite else "PDFEditor"
+    name = "TriVReader_Lite" if lite else "TriVReader"
     # ライト版は出力先を分ける（通常版と共存できるように）
     out_root = os.path.join(os.path.expanduser("~"),
-                            "PDFEditor_Lite_dist" if lite else "PDFEditor_dist")
+                            "TriVReader_Lite_dist" if lite else "TriVReader_dist")
     work = os.path.join(out_root, "_build")
     os.makedirs(work, exist_ok=True)
 
-    icon_path = os.path.join(work, "pdfeditor.ico")
+    icon_path = os.path.join(work, "trivreader.ico")
     make_icon(icon_path)
     print("icon:", icon_path)
 
@@ -117,7 +117,7 @@ def _sign_if_requested(exe: str) -> None:
     """--sign <PFX> が指定されていればコード署名する（任意）。
 
     例: python build_exe.py --sign C:\\path\\cert.pfx
-        パスワードは環境変数 PDFEDITOR_PFX_PW で渡す。
+        パスワードは環境変数 TRIVREADER_PFX_PW で渡す。
     自己署名証明書（社内配布向け）でも SmartScreen の「不明な発行元」を
     抑制できます（証明書を配布先の「信頼されたルート/発行元」に入れた場合）。
     """
@@ -135,7 +135,7 @@ def _sign_if_requested(exe: str) -> None:
     if not signtool:
         print("署名スキップ: signtool が見つかりません（Windows SDK を導入してください）")
         return
-    pw = os.environ.get("PDFEDITOR_PFX_PW", "")
+    pw = os.environ.get("TRIVREADER_PFX_PW", "")
     cmd = [signtool, "sign", "/fd", "SHA256", "/f", pfx]
     if pw:
         cmd += ["/p", pw]

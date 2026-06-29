@@ -33,8 +33,8 @@ LANGUAGE_CHOICES = {
 def cache_dir() -> str:
     """ダウンロードした言語データを置く書き込み可能ディレクトリ。
 
-    ポータブル時は exe 隣の PDFEditor_data\\tessdata、通常時は
-    %LOCALAPPDATA%\\pdfeditor\\tessdata（storage が判定）。
+    ポータブル時は exe 隣の TriVReader_data\\tessdata、通常時は
+    %LOCALAPPDATA%\\trivreader\\tessdata（storage が判定）。
     """
     from . import storage
 

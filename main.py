@@ -17,9 +17,9 @@ from viewer.main_window import MainWindow
 
 # ユーザー毎に一意なサーバー名（同一PCの複数ユーザーでも衝突しない）
 try:
-    _SERVER_NAME = f"PDFEditor-SingleInstance-{getpass.getuser()}"
+    _SERVER_NAME = f"TriVReader-SingleInstance-{getpass.getuser()}"
 except Exception:  # noqa: BLE001
-    _SERVER_NAME = "PDFEditor-SingleInstance"
+    _SERVER_NAME = "TriVReader-SingleInstance"
 
 
 def _install_japanese(app: QApplication) -> list:
@@ -35,7 +35,7 @@ def _install_japanese(app: QApplication) -> list:
 
 
 def _app_icon() -> QIcon:
-    """シンプルなアプリアイコン（青い角丸＋PDF）を生成する。"""
+    """シンプルなアプリアイコン（青い角丸＋TR）を生成する。"""
     pm = QPixmap(64, 64)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
@@ -48,7 +48,7 @@ def _app_icon() -> QIcon:
     f.setBold(True)
     f.setPointSize(15)
     p.setFont(f)
-    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "PDF")
+    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "TR")
     p.end()
     return QIcon(pm)
 
@@ -98,9 +98,9 @@ def main() -> int:
     if _send_to_running(file_arg):
         return 0
 
-    app.setApplicationName("PDF Editor")
-    app.setOrganizationName("pdfeditor")
-    app.setApplicationDisplayName("PDF Editor")
+    app.setApplicationName("TriV-Reader")
+    app.setOrganizationName("trivreader")
+    app.setApplicationDisplayName("TriV-Reader")
     app.setWindowIcon(_app_icon())
     # ウィンドウを閉じてもアプリは終了させない（トレイ常駐＝次回を高速化）。
     # 実際の終了は MainWindow 側で QApplication.quit() を明示的に呼ぶ。

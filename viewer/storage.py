@@ -1,10 +1,10 @@
 """設定・データの保存先を一元管理する（通常 / ポータブル両対応）。
 
 ポータブル判定: exe（またはプロジェクト）と同じ場所に portable.ini があれば
-ポータブルモード。設定は exe 隣の PDFEditor.ini、OCR 言語データなどは
-exe 隣の PDFEditor_data フォルダに保存され、フォルダごと持ち運べる。
+ポータブルモード。設定は exe 隣の TriVReader.ini、OCR 言語データなどは
+exe 隣の TriVReader_data フォルダに保存され、フォルダごと持ち運べる。
 
-通常モードでは設定はレジストリ、データは LOCALAPPDATA 配下の pdfeditor。
+通常モードでは設定はレジストリ、データは LOCALAPPDATA 配下の trivreader。
 """
 from __future__ import annotations
 
@@ -32,14 +32,14 @@ def is_lite() -> bool:
 def data_dir() -> str:
     """書き込み可能なデータ保存ディレクトリを返す（存在しなければ作成）。"""
     if is_portable():
-        d = os.path.join(base_dir(), "PDFEditor_data")
+        d = os.path.join(base_dir(), "TriVReader_data")
         try:
             os.makedirs(d, exist_ok=True)
             return d
         except OSError:
             pass  # exe 隣が書込不可ならフォールバック
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, "pdfeditor")
+    d = os.path.join(base, "trivreader")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -53,6 +53,6 @@ def make_settings():
     from PySide6.QtCore import QSettings
 
     if is_portable():
-        ini = os.path.join(base_dir(), "PDFEditor.ini")
+        ini = os.path.join(base_dir(), "TriVReader.ini")
         return QSettings(ini, QSettings.Format.IniFormat)
-    return QSettings("pdfeditor", "pdfeditor")
+    return QSettings("trivreader", "trivreader")
