@@ -12,6 +12,11 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    # Windows ランナーの標準出力は既定が cp1252 のため、日本語 print が
+    # UnicodeEncodeError で落ちる。Python の入出力を UTF-8 に固定して回避する。
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - name: ソース取得
         uses: actions/checkout@v4
