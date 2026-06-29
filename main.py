@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import getpass
+import os
 import sys
 
 from PySide6.QtCore import QLibraryInfo, Qt, QTranslator
@@ -34,8 +35,21 @@ def _install_japanese(app: QApplication) -> list:
     return keep
 
 
+def _resource_path(rel: str) -> str:
+    """同梱リソースの絶対パス（PyInstaller 凍結時は _MEIPASS 配下）。"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
 def _app_icon() -> QIcon:
-    """シンプルなアプリアイコン（青い角丸＋TR）を生成する。"""
+    """アプリアイコン。assets/app_icon.(ico|png) があればそれを使う。"""
+    for name in ("assets/app_icon.ico", "assets/app_icon.png"):
+        p = _resource_path(name)
+        if os.path.exists(p):
+            icon = QIcon(p)
+            if not icon.isNull():
+                return icon
+    # フォールバック: 画像が無ければ青い角丸＋TR を描画
     pm = QPixmap(64, 64)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)

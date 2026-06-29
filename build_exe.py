@@ -23,10 +23,27 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def make_icon(path: str) -> None:
-    """アプリ用 .ico を生成する（青角丸＋TR）。"""
+    """アプリ用 .ico を生成する。
+
+    assets/app_icon.png があればそれを .ico に変換して使う。
+    無ければ青角丸＋TR を描画する（フォールバック）。
+    """
     from PIL import Image, ImageDraw, ImageFont
 
     sizes = [256, 128, 64, 48, 32, 16]
+
+    src = os.path.join(HERE, "assets", "app_icon.png")
+    if os.path.exists(src):
+        img = Image.open(src).convert("RGBA")
+        # 正方形でなければ中央寄せで正方形キャンバスに収める
+        if img.width != img.height:
+            side = max(img.width, img.height)
+            canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+            canvas.paste(img, ((side - img.width) // 2, (side - img.height) // 2), img)
+            img = canvas
+        img.save(path, format="ICO", sizes=[(s, s) for s in sizes])
+        return
+
     base = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
     d = ImageDraw.Draw(base)
     d.rounded_rectangle([20, 20, 236, 236], radius=44, fill=(37, 99, 235, 255))
@@ -87,6 +104,10 @@ def main() -> int:
     ]
     for mod in excludes:
         args += ["--exclude-module", mod]
+    # アイコン画像を同梱（実行時のウィンドウ/タスクバーアイコン用）
+    assets_dir = os.path.join(HERE, "assets")
+    if os.path.isdir(assets_dir):
+        args += ["--add-data", f"{assets_dir}{os.pathsep}assets"]
     if onefile:
         args.append("--onefile")
     print("PyInstaller args:", " ".join(args))
