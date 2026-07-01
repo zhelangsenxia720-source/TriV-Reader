@@ -230,6 +230,10 @@ class MainWindow(QMainWindow):
         self.act_organize = QAction("ページ整理", self)
         self.act_organize.setCheckable(True)
         tb.addAction(self.act_organize)
+        self.act_form = QAction("フォーム入力", self)
+        self.act_form.setCheckable(True)
+        self.act_form.setToolTip("入力欄付きPDFの各欄に文字を入力できるようにする")
+        tb.addAction(self.act_form)
         tb.addSeparator()
 
         self.act_delete = QAction("ページ削除", self)
@@ -422,6 +426,7 @@ class MainWindow(QMainWindow):
 
         m_pages = mb.addMenu("ページ(&P)")
         m_pages.addAction(self.act_organize)
+        m_pages.addAction(self.act_form)
         m_pages.addSeparator()
         m_pages.addAction(self.act_delete)
         m_pages.addAction(self.act_merge)
@@ -642,6 +647,7 @@ class MainWindow(QMainWindow):
         self.act_extract.triggered.connect(self.extract_pages)
         self.act_split.triggered.connect(self.split_pdf)
         self.act_organize.toggled.connect(self._toggle_organize)
+        self.act_form.toggled.connect(self._toggle_form)
         self.act_to_images.triggered.connect(self.export_images_dialog)
         self.act_from_images.triggered.connect(self.images_to_pdf_dialog)
         self.act_add_images.triggered.connect(self.add_images_as_pages)
@@ -708,6 +714,7 @@ class MainWindow(QMainWindow):
         pv.selection_changed.connect(self._on_selection_changed)
         pv.text_selection_changed.connect(self._on_text_selection_changed)
         pv.zoom_changed.connect(self._on_zoom_changed)
+        pv.form_changed.connect(self._on_form_changed)
         org.reordered.connect(self._reorder_from_organizer)
         org.delete_requested.connect(self._delete_pages)
         org.extract_requested.connect(self._extract_indices)
@@ -870,6 +877,10 @@ class MainWindow(QMainWindow):
         self.act_organize.blockSignals(True)
         self.act_organize.setChecked(tab.currentWidget() is tab.organizer)
         self.act_organize.blockSignals(False)
+        # フォーム入力トグルをこのタブの状態に同期
+        self.act_form.blockSignals(True)
+        self.act_form.setChecked(tab.page_view.form_mode())
+        self.act_form.blockSignals(False)
         # 検索UIをこのタブに同期
         self.search_edit.clear()
         self._update_search_label()
@@ -1705,6 +1716,24 @@ class MainWindow(QMainWindow):
         else:
             tab.setCurrentWidget(tab.page_view)
 
+    # --- フォーム入力の切り替え ---------------------------------------
+    def _toggle_form(self, on: bool) -> None:
+        tab = self._active_tab()
+        if tab is None:
+            return
+        if on and tab.currentWidget() is tab.organizer:
+            # 整理画面ではなくビューワーに切り替えてから入力
+            self.act_organize.setChecked(False)
+        tab.page_view.set_form_mode(on)
+        if on:
+            self.statusBar().showMessage(
+                "フォーム入力モード: 黄色い欄をクリックして入力できます", 4000)
+
+    def _on_form_changed(self) -> None:
+        """フォーム欄の値が変わったら未保存状態を反映。"""
+        self._update_title()
+        self._update_actions()
+
     def _jump_from_organizer(self, index: int) -> None:
         """整理画面でダブルクリックされたページをビューワーで開く。"""
         self.act_organize.setChecked(False)  # ビューワーへ戻す
@@ -2121,6 +2150,13 @@ class MainWindow(QMainWindow):
         self.search_edit.setEnabled(has)
         # 画像→PDF は PDF を開いていなくても使える
         self.act_from_images.setEnabled(True)
+        # フォーム入力は「入力欄付きPDF」を開いているときだけ有効
+        is_form = has and self.doc.is_form()
+        self.act_form.setEnabled(is_form)
+        if not is_form and self.act_form.isChecked():
+            self.act_form.blockSignals(True)
+            self.act_form.setChecked(False)
+            self.act_form.blockSignals(False)
 
     # --- 終了確認 -------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)

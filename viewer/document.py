@@ -492,6 +492,58 @@ class PdfDocument:
         ys = sorted([p0.y * zoom, p1.y * zoom])
         return (xs[0], ys[0], xs[1], ys[1])
 
+    # --- フォーム（AcroForm 入力欄）------------------------------------
+    def is_form(self) -> bool:
+        """入力欄付き（フォーム）PDF かどうか。"""
+        return bool(self._doc) and bool(getattr(self._doc, "is_form_pdf", False))
+
+    @staticmethod
+    def _widget_kind(field_type) -> str:
+        return {
+            fitz.PDF_WIDGET_TYPE_TEXT: "text",
+            fitz.PDF_WIDGET_TYPE_CHECKBOX: "checkbox",
+            fitz.PDF_WIDGET_TYPE_COMBOBOX: "combo",
+            fitz.PDF_WIDGET_TYPE_LISTBOX: "list",
+            fitz.PDF_WIDGET_TYPE_RADIOBUTTON: "radio",
+        }.get(field_type, "text")
+
+    def page_fields(self, index: int) -> list:
+        """指定ページのフォーム欄一覧。各要素は dict（rect は fitz.Rect）。"""
+        if not self._doc:
+            return []
+        page = self._doc.load_page(index)
+        out = []
+        for w in (page.widgets() or []):
+            out.append({
+                "xref": w.xref,
+                "name": w.field_name or "",
+                "kind": self._widget_kind(w.field_type),
+                "value": w.field_value if w.field_value is not None else "",
+                "rect": w.rect,
+                "choices": list(w.choice_values) if getattr(w, "choice_values", None) else [],
+                "maxlen": int(getattr(w, "text_maxlen", 0) or 0),
+            })
+        return out
+
+    def set_field_value(self, index: int, xref: int, value) -> bool:
+        """xref で欄を特定し値を設定して外観を更新する。成功で True。"""
+        if not self._doc:
+            return False
+        page = self._doc.load_page(index)
+        for w in (page.widgets() or []):
+            if w.xref == xref:
+                try:
+                    if w.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+                        w.field_value = bool(value)
+                    else:
+                        w.field_value = "" if value is None else str(value)
+                    w.update()
+                    self.modified = True
+                    return True
+                except Exception:  # noqa: BLE001
+                    return False
+        return False
+
     @staticmethod
     def _find_on(page, xref):
         for annot in page.annots():

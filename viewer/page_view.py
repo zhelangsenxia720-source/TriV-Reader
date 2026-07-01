@@ -8,9 +8,12 @@ from __future__ import annotations
 from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QCursor, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
     QGridLayout,
     QLabel,
     QLayout,
+    QLineEdit,
     QMenu,
     QScrollArea,
     QWidget,
@@ -310,6 +313,7 @@ class PageView(QScrollArea):
     selection_changed = Signal(bool)       # 注釈の選択有無が変わった
     text_selection_changed = Signal(bool)  # テキスト選択の有無が変わった
     zoom_changed = Signal(float)           # ズーム倍率が変わった
+    form_changed = Signal()                # フォーム入力欄の値が変わった
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -329,6 +333,9 @@ class PageView(QScrollArea):
         self._doc: PdfDocument | None = None
         self._labels: list[QLabel] = []
         self._rendered: set[int] = set()
+        # フォーム（入力欄）入力モード
+        self._form_mode = False
+        self._form_overlays: list[QWidget] = []
         self._index: int = 0
         self._zoom: float = 1.0
         self._cols = 1  # 1=通常 / 2=見開き
@@ -375,6 +382,8 @@ class PageView(QScrollArea):
         self._doc = doc
         self._index = 0
         self._zoom = 1.0
+        self._form_mode = False
+        self._clear_form_overlays()
         self._rebuild(fit=True, target=0)
 
     def reload(self, target: int = 0) -> None:
@@ -721,6 +730,8 @@ class PageView(QScrollArea):
         self._zoom = zoom
         self._resize_all()
         self.set_page(anchor)
+        if self._form_mode:
+            self._build_form_overlays()  # ズーム変更で位置がずれるため作り直す
         self.zoom_changed.emit(self._zoom)
 
     def fit_width(self) -> None:
@@ -745,6 +756,83 @@ class PageView(QScrollArea):
         """表示中ページ周辺を再描画する。"""
         self._render_visible()
 
+    # --- フォーム入力（入力欄付きPDF）----------------------------------
+    def form_mode(self) -> bool:
+        return self._form_mode
+
+    def set_form_mode(self, on: bool) -> None:
+        """入力欄の上に編集用コントロールを重ねる/外す。"""
+        self._form_mode = on
+        if on:
+            self._build_form_overlays()
+        else:
+            self._clear_form_overlays()
+            # 入力済みの値を反映するため再描画する
+            self._rendered.clear()
+            self._render_visible()
+
+    def _clear_form_overlays(self) -> None:
+        for w in self._form_overlays:
+            w.setParent(None)
+            w.deleteLater()
+        self._form_overlays.clear()
+
+    def _build_form_overlays(self) -> None:
+        self._clear_form_overlays()
+        if not self._form_mode or not self._doc or not self._doc.is_open:
+            return
+        for index in range(min(self._doc.page_count, len(self._labels))):
+            label = self._labels[index]
+            try:
+                fields = self._doc.page_fields(index)
+            except Exception:  # noqa: BLE001
+                fields = []
+            for field in fields:
+                ctl = self._make_form_control(index, field, label)
+                if ctl is not None:
+                    self._form_overlays.append(ctl)
+
+    def _make_form_control(self, index, field, label):
+        x0, y0, x1, y1 = self._doc.pdf_rect_to_label(index, field["rect"], self._zoom)
+        w = max(int(x1 - x0), 14)
+        h = max(int(y1 - y0), 14)
+        xref = field["xref"]
+        kind = field["kind"]
+        value = field["value"]
+        if kind == "checkbox":
+            ctl = QCheckBox(label)
+            checked = str(value) not in ("", "Off", "/Off", "No", "false", "False", "0")
+            ctl.setChecked(checked)
+            ctl.toggled.connect(
+                lambda on, i=index, x=xref: self._commit_field(i, x, on))
+        elif kind in ("combo", "list"):
+            ctl = QComboBox(label)
+            ctl.setEditable(kind == "combo")
+            ctl.addItems(field["choices"])
+            if value and value not in field["choices"]:
+                ctl.addItem(str(value))
+            ctl.setCurrentText(str(value))
+            ctl.currentTextChanged.connect(
+                lambda text, i=index, x=xref: self._commit_field(i, x, text))
+        else:  # text / radio / その他 → テキスト入力
+            ctl = QLineEdit(label)
+            ctl.setText(str(value))
+            if field.get("maxlen"):
+                ctl.setMaxLength(field["maxlen"])
+            ctl.editingFinished.connect(
+                lambda i=index, x=xref, c=ctl: self._commit_field(i, x, c.text()))
+        ctl.setGeometry(int(x0), int(y0), w, h)
+        ctl.setStyleSheet(
+            "QLineEdit, QComboBox { background: rgba(255,247,170,160);"
+            " border: 1px solid #d0a000; padding: 0px 2px; }"
+            "QCheckBox { background: rgba(255,247,170,160); }")
+        ctl.show()
+        return ctl
+
+    def _commit_field(self, index, xref, value) -> None:
+        if self._doc and self._doc.set_field_value(index, xref, value):
+            self.form_changed.emit()
+
     # --- 構築・レイアウト ----------------------------------------------
     def _rebuild(self, fit: bool, target: int) -> None:
         # 既存ラベルを破棄
@@ -755,6 +843,7 @@ class PageView(QScrollArea):
                 w.deleteLater()
         self._labels.clear()
         self._rendered.clear()
+        self._clear_form_overlays()  # 旧ラベルと一緒に消えるので参照も掃除
 
         if not self._doc or not self._doc.is_open:
             self._relayout_container()
@@ -769,6 +858,8 @@ class PageView(QScrollArea):
         if fit:
             self.fit_width()
         self.set_page(target)
+        if self._form_mode:
+            self._build_form_overlays()
 
     def set_facing(self, on: bool) -> None:
         """見開き表示(2列)のオン/オフ。"""
