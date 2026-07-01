@@ -1536,48 +1536,126 @@ class MainWindow(QMainWindow):
         lay.addWidget(box)
         dlg.exec()
 
+    # 印刷サイズモード
+    PRINT_ACTUAL, PRINT_FIT, PRINT_SHRINK, PRINT_CUSTOM = range(4)
+
+    def _ask_print_size(self) -> tuple | None:
+        """Adobe 風の印刷サイズ指定ダイアログ。(mode, scale) か None を返す。"""
+        from PySide6.QtWidgets import (
+            QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLabel,
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("印刷 — サイズ")
+        form = QFormLayout(dlg)
+        info = QLabel(
+            "厚労省の様式など、決まった寸法で印刷する場合は「実際のサイズ」を選んでください。")
+        info.setWordWrap(True)
+        form.addRow(info)
+        combo = QComboBox()
+        combo.addItems([
+            "実際のサイズ (100%)",
+            "ページに合わせる",
+            "特大ページを縮小",
+            "カスタム倍率",
+        ])
+        combo.setCurrentIndex(int(self.settings.value("print_mode", self.PRINT_ACTUAL, int)))
+        form.addRow("印刷サイズ:", combo)
+        scale = QDoubleSpinBox()
+        scale.setRange(10.0, 400.0)
+        scale.setValue(float(self.settings.value("print_scale", 100.0, float)))
+        scale.setSuffix(" %")
+        form.addRow("倍率:", scale)
+
+        def _sync():
+            scale.setEnabled(combo.currentIndex() == self.PRINT_CUSTOM)
+
+        combo.currentIndexChanged.connect(_sync)
+        _sync()
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        mode = combo.currentIndex()
+        self.settings.setValue("print_mode", mode)
+        self.settings.setValue("print_scale", scale.value())
+        return mode, scale.value() / 100.0
+
     def print_document(self) -> None:
         if not self.doc.is_open:
             return
-        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-        if QPrintDialog(printer, self).exec() != QPrintDialog.DialogCode.Accepted:
+        chosen = self._ask_print_size()
+        if chosen is None:
             return
+        mode, custom_scale = chosen
+
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dialog = QPrintDialog(printer, self)
+        dialog.setOption(QPrintDialog.PrintDialogOption.PrintPageRange, True)
+        dialog.setOption(QPrintDialog.PrintDialogOption.PrintCurrentPage, True)
+        if dialog.exec() != QPrintDialog.DialogCode.Accepted:
+            return
+
         from PySide6.QtCore import QRectF
         from PySide6.QtGui import QPainter
 
-        # 印刷用の描画DPI。プリンタ解像度に合わせつつ 300dpi で頭打ちにする。
-        # （従来は 144dpi 相当で描画→プリンタ面へ拡大していたため遅く・ぼやけていた）
-        target_dpi = min(printer.resolution() or 300, 300)
-        zoom = target_dpi / 72.0
+        # 印刷対象ページ（印刷範囲を反映）
+        total = self.doc.page_count
+        if printer.printRange() == QPrinter.PrintRange.PageRange:
+            pages = list(range(printer.fromPage() - 1, printer.toPage()))
+        elif printer.printRange() == QPrinter.PrintRange.CurrentPage:
+            pages = [self.page_view.index]
+        else:
+            pages = list(range(total))
+        pages = [i for i in pages if 0 <= i < total]
+        if not pages:
+            return
+
+        res = printer.resolution() or 300           # プリンタの dpi
+        render_dpi = min(res, 300)                   # 描画は 300dpi で頭打ち（高速・高画質）
+        zoom = render_dpi / 72.0
 
         painter = QPainter(printer)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
-        count = self.doc.page_count
-        progress = QProgressDialog("印刷を準備中…", "キャンセル", 0, count, self)
+        page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)  # 印刷可能領域(px)
+        progress = QProgressDialog("印刷を準備中…", "キャンセル", 0, len(pages), self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(400)
         try:
-            for i in range(count):
-                progress.setValue(i)
+            for n, i in enumerate(pages):
+                progress.setValue(n)
                 if progress.wasCanceled():
                     painter.end()
                     self.statusBar().showMessage("印刷をキャンセルしました", 3000)
                     return
-                if i > 0:
+                if n > 0:
                     printer.newPage()
+                # ページの実寸(pt) → 実際のサイズでの紙面ピクセル数（1pt = 1/72inch）
+                w_pt, h_pt = self.doc.page_pixel_size(i, 1.0)
+                nat_w = w_pt / 72.0 * res
+                nat_h = h_pt / 72.0 * res
+                if nat_w <= 0 or nat_h <= 0:
+                    continue
+                fit = min(page_rect.width() / nat_w, page_rect.height() / nat_h)
+                if mode == self.PRINT_ACTUAL:
+                    s = 1.0
+                elif mode == self.PRINT_FIT:
+                    s = fit
+                elif mode == self.PRINT_SHRINK:
+                    s = min(1.0, fit)
+                else:  # PRINT_CUSTOM
+                    s = custom_scale
+                tgt_w = nat_w * s
+                tgt_h = nat_h * s
+                x = page_rect.left() + (page_rect.width() - tgt_w) / 2
+                y = page_rect.top() + (page_rect.height() - tgt_h) / 2
                 pix = self.doc.render_page(i, zoom=zoom)
-                # ページ枠にアスペクト比を保って収め、描画時に紙面へスケール（高速・高画質）
-                if pix.width() and pix.height():
-                    scale = min(page_rect.width() / pix.width(),
-                                page_rect.height() / pix.height())
-                    w = pix.width() * scale
-                    h = pix.height() * scale
-                    x = page_rect.left() + (page_rect.width() - w) / 2
-                    y = page_rect.top() + (page_rect.height() - h) / 2
-                    painter.drawPixmap(QRectF(x, y, w, h), pix,
-                                       QRectF(0, 0, pix.width(), pix.height()))
-            progress.setValue(count)
+                painter.drawPixmap(QRectF(x, y, tgt_w, tgt_h), pix,
+                                   QRectF(0, 0, pix.width(), pix.height()))
+            progress.setValue(len(pages))
         finally:
             if painter.isActive():
                 painter.end()
@@ -2319,19 +2397,10 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
-        # トレイ常駐が有効で通常の×なら、終了せずトレイへ隠す（次回起動を高速化）
+        # トレイ常駐が有効で通常の×なら、終了せずトレイへ隠す（通知は出さない）
         if not self._force_quit and self._tray_resident_enabled():
             event.ignore()
             self.hide()
-            if not self._tray_notified:
-                self._tray_notified = True
-                self.tray.showMessage(
-                    "TriV-Reader",
-                    "トレイで実行中です。次回 PDF を開くとすぐに表示されます。\n"
-                    "完全に終了するにはトレイアイコンを右クリック →「終了」。",
-                    QSystemTrayIcon.MessageIcon.Information,
-                    4000,
-                )
             return
 
         self._save_settings()
