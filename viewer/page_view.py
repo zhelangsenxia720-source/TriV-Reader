@@ -1006,6 +1006,19 @@ class PageView(QScrollArea):
             step = max(bar.singleStep(), 60)
             bar.setValue(bar.value() + (step if key == Qt.Key.Key_Down else -step))
             return
+        # Home/End で先頭/最終ページ、Space で1画面送り（Shift+Space で戻り）
+        if key == Qt.Key.Key_Home:
+            self.set_page(0)
+            return
+        if key == Qt.Key.Key_End and self._doc and self._doc.is_open:
+            self.set_page(self._doc.page_count - 1)
+            return
+        if key == Qt.Key.Key_Space:
+            bar = self.verticalScrollBar()
+            step = self.viewport().height() - 40
+            back = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            bar.setValue(bar.value() + (-step if back else step))
+            return
         super().keyPressEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)

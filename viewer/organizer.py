@@ -8,10 +8,15 @@ from __future__ import annotations
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -116,6 +121,33 @@ class _Grid(QListWidget):
         self.reordered.emit(new_order, new_selected)
 
 
+class InsertDialog(QDialog):
+    """挿入の内容（PDF/白紙）と位置（先頭/末尾/選択の前/後ろ）を選ぶダイアログ。"""
+
+    POS_FRONT, POS_BACK, POS_BEFORE, POS_AFTER = range(4)
+
+    def __init__(self, has_selection: bool, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("ページを挿入")
+        form = QFormLayout(self)
+        self.kind = QComboBox()
+        self.kind.addItems(["PDF ファイルから…", "白紙ページ"])
+        form.addRow("挿入する内容:", self.kind)
+        self.pos = QComboBox()
+        self.pos.addItems(["先頭", "末尾", "選択ページの前", "選択ページの後ろ"])
+        if not has_selection:
+            # 選択が無いときは前/後は選べない
+            for i in (self.POS_BEFORE, self.POS_AFTER):
+                self.pos.model().item(i).setEnabled(False)
+        self.pos.setCurrentIndex(self.POS_BACK)
+        form.addRow("挿入する場所:", self.pos)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+
 class PageOrganizer(QWidget):
     """ページ整理画面。各操作は選択ページに対して行う。"""
 
@@ -124,8 +156,11 @@ class PageOrganizer(QWidget):
     extract_requested = Signal(list)  # 選択ページの抽出
     export_images_requested = Signal(list)  # 選択ページを画像に書き出し
     rotate_requested = Signal(list, int)  # 選択ページの回転(度)
-    split_requested = Signal()        # 分割
+    split_requested = Signal()        # 分割（リボン用に残置）
     page_activated = Signal(int)      # ダブルクリックでビューワーへ
+    insert_requested = Signal(str, int)   # ("file"|"blank", 挿入位置)
+    properties_requested = Signal()   # プロパティ（メタデータ）
+    security_requested = Signal()     # セキュリティ（パスワード保護）
 
     THUMB = 190
 
@@ -138,62 +173,144 @@ class PageOrganizer(QWidget):
         self._sel_label.setStyleSheet("font-weight:bold; color:#1a73e8;")
         bar.addWidget(self._sel_label)
         bar.addStretch(1)
+        # メニュー構成: 挿入、抽出、削除、画像、先頭へ、左へ、右へ、末尾へ、
+        #               左回転、右回転、プロパティ、セキュリティ
+        self._btn_insert = QPushButton("挿入")
+        self._btn_extract = QPushButton("抽出")
+        self._btn_delete = QPushButton("削除")
+        self._btn_images = QPushButton("画像")
         self._btn_front = QPushButton("⏮ 先頭へ")
         self._btn_move_l = QPushButton("◀ 左へ")
         self._btn_move_r = QPushButton("右へ ▶")
         self._btn_back = QPushButton("末尾へ ⏭")
         self._btn_rotate_l = QPushButton("⟲ 左回転")
         self._btn_rotate_r = QPushButton("⟳ 右回転")
-        self._btn_delete = QPushButton("選択を削除")
-        self._btn_extract = QPushButton("選択を抽出")
-        self._btn_images = QPushButton("選択を画像に")
-        self._btn_split = QPushButton("分割")
+        self._btn_props = QPushButton("プロパティ")
+        self._btn_security = QPushButton("セキュリティ")
         for b in (
+            self._btn_insert,
+            self._btn_extract,
+            self._btn_delete,
+            self._btn_images,
             self._btn_front,
             self._btn_move_l,
             self._btn_move_r,
             self._btn_back,
             self._btn_rotate_l,
             self._btn_rotate_r,
-            self._btn_delete,
-            self._btn_extract,
-            self._btn_images,
-            self._btn_split,
+            self._btn_props,
+            self._btn_security,
         ):
             bar.addWidget(b)
         layout.addLayout(bar)
         hint = QLabel(
-            "ページを選択して「先頭へ / ◀左へ / 右へ▶ / 末尾へ」で並べ替え。"
+            "ページを選択して操作します（右クリックでもメニューが出ます）。"
             "Ctrl/Shift で複数選択できます。"
         )
         hint.setStyleSheet("color:#777;")
         layout.addWidget(hint)
 
         self.grid = _Grid(self.THUMB)
+        self.grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.grid.customContextMenuRequested.connect(self._on_context_menu)
         layout.addWidget(self.grid)
 
         # 配線
-        self._btn_front.clicked.connect(lambda: self.grid.move_to_edge(True))
-        self._btn_back.clicked.connect(lambda: self.grid.move_to_edge(False))
-        self._btn_move_l.clicked.connect(lambda: self.grid.move_selected(-1))
-        self._btn_move_r.clicked.connect(lambda: self.grid.move_selected(1))
-        self._btn_rotate_l.clicked.connect(
-            lambda: self._emit_rotate(-90)
-        )
-        self._btn_rotate_r.clicked.connect(lambda: self._emit_rotate(90))
-        self._btn_delete.clicked.connect(
-            lambda: self._emit_selected(self.delete_requested)
-        )
+        self._btn_insert.clicked.connect(self._insert_dialog)
         self._btn_extract.clicked.connect(
             lambda: self._emit_selected(self.extract_requested)
+        )
+        self._btn_delete.clicked.connect(
+            lambda: self._emit_selected(self.delete_requested)
         )
         self._btn_images.clicked.connect(
             lambda: self._emit_selected(self.export_images_requested)
         )
-        self._btn_split.clicked.connect(self.split_requested.emit)
+        self._btn_front.clicked.connect(lambda: self.grid.move_to_edge(True))
+        self._btn_back.clicked.connect(lambda: self.grid.move_to_edge(False))
+        self._btn_move_l.clicked.connect(lambda: self.grid.move_selected(-1))
+        self._btn_move_r.clicked.connect(lambda: self.grid.move_selected(1))
+        self._btn_rotate_l.clicked.connect(lambda: self._emit_rotate(-90))
+        self._btn_rotate_r.clicked.connect(lambda: self._emit_rotate(90))
+        self._btn_props.clicked.connect(self.properties_requested.emit)
+        self._btn_security.clicked.connect(self.security_requested.emit)
         self.grid.reordered.connect(self.reordered.emit)
         self.grid.itemDoubleClicked.connect(self._on_double_click)
         self.grid.itemSelectionChanged.connect(self._update_selection_label)
+
+    # --- 挿入 / 右クリックメニュー --------------------------------------
+    def _insert_position(self, pos_index: int) -> int:
+        """InsertDialog の位置選択を実際の挿入インデックスへ変換する。"""
+        sel = self.selected_indices()
+        if pos_index == InsertDialog.POS_FRONT:
+            return 0
+        if pos_index == InsertDialog.POS_BEFORE and sel:
+            return sel[0]
+        if pos_index == InsertDialog.POS_AFTER and sel:
+            return sel[-1] + 1
+        return self.grid.count()  # 末尾
+
+    def _insert_dialog(self) -> None:
+        dlg = InsertDialog(bool(self.selected_indices()), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        kind = "file" if dlg.kind.currentIndex() == 0 else "blank"
+        at = self._insert_position(dlg.pos.currentIndex())
+        self.insert_requested.emit(kind, at)
+
+    def _on_context_menu(self, pos) -> None:
+        item = self.grid.itemAt(pos)
+        if item is not None and not item.isSelected():
+            self.grid.clearSelection()
+            item.setSelected(True)
+        has_sel = bool(self.selected_indices())
+        menu = QMenu(self)
+        act_insert = menu.addAction("挿入…")
+        menu.addSeparator()
+        act_extract = menu.addAction("抽出")
+        act_delete = menu.addAction("削除")
+        act_images = menu.addAction("画像に書き出し")
+        menu.addSeparator()
+        act_front = menu.addAction("先頭へ")
+        act_left = menu.addAction("左へ")
+        act_right = menu.addAction("右へ")
+        act_back = menu.addAction("末尾へ")
+        menu.addSeparator()
+        act_rot_l = menu.addAction("左回転")
+        act_rot_r = menu.addAction("右回転")
+        menu.addSeparator()
+        act_props = menu.addAction("プロパティ")
+        act_sec = menu.addAction("セキュリティ")
+        for a in (act_extract, act_delete, act_images, act_front, act_left,
+                  act_right, act_back, act_rot_l, act_rot_r):
+            a.setEnabled(has_sel)
+        chosen = menu.exec(self.grid.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_insert:
+            self._insert_dialog()
+        elif chosen is act_extract:
+            self._emit_selected(self.extract_requested)
+        elif chosen is act_delete:
+            self._emit_selected(self.delete_requested)
+        elif chosen is act_images:
+            self._emit_selected(self.export_images_requested)
+        elif chosen is act_front:
+            self.grid.move_to_edge(True)
+        elif chosen is act_left:
+            self.grid.move_selected(-1)
+        elif chosen is act_right:
+            self.grid.move_selected(1)
+        elif chosen is act_back:
+            self.grid.move_to_edge(False)
+        elif chosen is act_rot_l:
+            self._emit_rotate(-90)
+        elif chosen is act_rot_r:
+            self._emit_rotate(90)
+        elif chosen is act_props:
+            self.properties_requested.emit()
+        elif chosen is act_sec:
+            self.security_requested.emit()
 
     # --- 読み込み -------------------------------------------------------
     def load(self, doc: PdfDocument) -> None:

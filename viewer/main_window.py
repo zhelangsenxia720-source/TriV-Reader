@@ -355,31 +355,41 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_clear_annots)
 
     def _build_search_toolbar(self) -> None:
-        """検索バー（別段）。"""
-        self.addToolBarBreak()
-        tb = self.addToolBar("検索")
-        tb.setMovable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self.search_toolbar = tb
-        tb.addWidget(QLabel(" 検索 "))
+        """検索ポップアップ（Ctrl+F / 検索ボタンで表示される小窓）。"""
+        from PySide6.QtWidgets import QDialog, QHBoxLayout, QToolButton
+
+        self.act_search_prev = QAction("◀ 前", self)
+        self.act_search_next = QAction("次 ▶", self)
+        self.act_highlight_all = QAction("全てハイライト", self)
+
+        pop = QDialog(self)
+        pop.setWindowTitle("検索")
+        pop.setWindowFlags(Qt.WindowType.Tool
+                           | Qt.WindowType.WindowCloseButtonHint)
+        row = QHBoxLayout(pop)
+        row.setContentsMargins(8, 6, 8, 6)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("テキストを検索… (Enter)")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.setMaximumWidth(320)
-        tb.addWidget(self.search_edit)
-        self.act_search_prev = QAction("◀ 前", self)
-        self.act_search_next = QAction("次 ▶", self)
-        tb.addAction(self.act_search_prev)
-        tb.addAction(self.act_search_next)
+        self.search_edit.setMinimumWidth(220)
+        row.addWidget(self.search_edit)
+        for act in (self.act_search_prev, self.act_search_next):
+            b = QToolButton()
+            b.setDefaultAction(act)
+            b.setAutoRaise(True)
+            row.addWidget(b)
         self.search_count_label = QLabel("  0 件  ")
-        tb.addWidget(self.search_count_label)
-        self.act_highlight_all = QAction("全てハイライト", self)
-        tb.addAction(self.act_highlight_all)
+        row.addWidget(self.search_count_label)
+        b = QToolButton()
+        b.setDefaultAction(self.act_highlight_all)
+        b.setAutoRaise(True)
+        row.addWidget(b)
+        self.search_popup = pop
 
         # ページ番号
         self.act_page_numbers = QAction("ページ番号を追加…", self)
 
-        # Ctrl+F で検索欄へフォーカス
+        # Ctrl+F で検索ポップアップを表示
         self.act_find = QAction("検索", self)
         self.act_find.setShortcut(QKeySequence.StandardKey.Find)
         self.addAction(self.act_find)
@@ -421,9 +431,6 @@ class MainWindow(QMainWindow):
         self.act_toggle_annotbar = self.annot_toolbar.toggleViewAction()
         self.act_toggle_annotbar.setText("注釈バーを表示")
         m_view.addAction(self.act_toggle_annotbar)
-        self.act_toggle_searchbar = self.search_toolbar.toggleViewAction()
-        self.act_toggle_searchbar.setText("検索バーを表示")
-        m_view.addAction(self.act_toggle_searchbar)
         m_view.addSeparator()
         m_view.addAction(self.act_copy)
         m_view.addSeparator()
@@ -546,11 +553,7 @@ class MainWindow(QMainWindow):
         g = r.add_group(p, "回転")
         g.add_stack([self.act_rotate_left, self.act_rotate_right])
         g = r.add_group(p, "検索")
-        self.search_edit.setMaximumWidth(200)
-        g.add_widget(self.search_edit)
-        g.add_stack([self.act_search_prev, self.act_search_next,
-                     self.act_highlight_all])
-        g.add_widget(self.search_count_label)
+        g.add_action(self.act_find, big=True)  # 押すと検索ポップアップが出る
         r.end_page(p)
 
         # ── 注釈 ────────────────────────────────────────────────
@@ -605,6 +608,7 @@ class MainWindow(QMainWindow):
         g = r.add_group(p, "パネル")
         toc_toggle = self.toc_dock.toggleViewAction()
         toc_toggle.setIconText("しおり一覧")
+        toc_toggle.setIcon(self._glyph_icon("📑"))
         g.add_stack([self.act_toggle_pagedock, toc_toggle])
         g = r.add_group(p, "しおり")
         g.add_stack([self.act_add_bookmark, self.act_edit_toc])
@@ -615,7 +619,7 @@ class MainWindow(QMainWindow):
         # リボンを最上部に据え、従来のメニューバー/ツールバーは隠す
         self.setMenuWidget(r)
         r.setStyleSheet(RIBBON_QSS)
-        for tb in (self.main_toolbar, self.annot_toolbar, self.search_toolbar):
+        for tb in (self.main_toolbar, self.annot_toolbar):
             tb.hide()
         # 折りたたみ状態を復元
         if self.settings.value("ribbon_collapsed", False, bool):
@@ -733,6 +737,7 @@ class MainWindow(QMainWindow):
             self.act_protect: "🔒", self.act_unlock: "🔓",
             self.act_compress: "🗜", self.act_export_pdfa: "🅰",
             self.act_dark: "🌙", self.act_add_bookmark: "🔖",
+            self.act_find: "🔍",
             self.act_edit_toc: "📇", self.act_check_update: "🔄",
             self.act_set_update_url: "⚙", self.act_about: "ℹ",
             self.act_toggle_pagedock: "▤",
@@ -761,7 +766,7 @@ class MainWindow(QMainWindow):
 
     def _tighten_chrome(self) -> None:
         """ツールバー・メニューバーの余白を詰める（既定状態で適用）。"""
-        for tb in (self.main_toolbar, self.annot_toolbar, self.search_toolbar):
+        for tb in (self.main_toolbar, self.annot_toolbar):
             tb.setContentsMargins(0, 0, 0, 0)
             tb.setStyleSheet(self._TOOLBAR_QSS)
         self.menuBar().setStyleSheet(
@@ -780,7 +785,7 @@ class MainWindow(QMainWindow):
             "QToolBar { padding: 0px; spacing: 1px; }"
             "QToolButton { padding: 2px; margin: 0px; border-radius: 4px; }"
         )
-        for tb in (self.main_toolbar, self.annot_toolbar, self.search_toolbar):
+        for tb in (self.main_toolbar, self.annot_toolbar):
             tb.setToolButtonStyle(style)
             tb.setIconSize(QSize(18, 18) if on else QSize(16, 16))
             tb.setContentsMargins(0, 0, 0, 0)
@@ -872,6 +877,57 @@ class MainWindow(QMainWindow):
         self.thumbnails.pages_reordered.connect(self._reorder)
         self.thumbnails.delete_requested.connect(self._delete_page)
         # 注: page_view / organizer のシグナルはタブ毎に _new_tab で接続する
+        self._setup_shortcuts()
+
+    def _setup_shortcuts(self) -> None:
+        """一般的な PDF リーダーのキーボードショートカット。
+
+        （PageView 側: ←→=ページ送り, ↑↓=スクロール, Home/End=先頭/最終,
+          Space / Shift+Space=1画面送り/戻り）
+        """
+        from PySide6.QtGui import QShortcut
+
+        # F3 / Shift+F3: 次/前の検索結果
+        self.act_search_next.setShortcut(QKeySequence(Qt.Key.Key_F3))
+        self.act_search_prev.setShortcut(QKeySequence("Shift+F3"))
+        self.addAction(self.act_search_next)
+        self.addAction(self.act_search_prev)
+        # Ctrl+0: 幅に合わせる
+        self.act_fit.setShortcut(QKeySequence("Ctrl+0"))
+        self.addAction(self.act_fit)
+        # Ctrl+1: 実際のサイズ (100%)
+        QShortcut(QKeySequence("Ctrl+1"), self,
+                  lambda: self.page_view.set_zoom(1.0))
+        # Ctrl+Home / Ctrl+End: 先頭 / 最終ページ
+        QShortcut(QKeySequence("Ctrl+Home"), self,
+                  lambda: self.page_view.set_page(0))
+        QShortcut(QKeySequence("Ctrl+End"), self,
+                  lambda: self.doc.is_open and self.page_view.set_page(
+                      self.doc.page_count - 1))
+        # Ctrl+G: ページ番号入力欄へ
+        QShortcut(QKeySequence("Ctrl+G"), self, self._focus_page_edit)
+        # Ctrl+W: 現在のタブを閉じる
+        QShortcut(QKeySequence("Ctrl+W"), self,
+                  lambda: self.tabs.count() and self._close_tab(
+                      self.tabs.currentIndex()))
+        # Ctrl+Tab / Ctrl+Shift+Tab: タブ切替
+        QShortcut(QKeySequence("Ctrl+Tab"), self, lambda: self._cycle_tab(1))
+        QShortcut(QKeySequence("Ctrl+Shift+Tab"), self,
+                  lambda: self._cycle_tab(-1))
+
+    def _focus_page_edit(self) -> None:
+        if not hasattr(self, "page_edit"):
+            return
+        if self.ribbon.is_collapsed():
+            self.ribbon._expand_if_collapsed(self.ribbon.currentIndex())
+        self.ribbon.setCurrentIndex(0)  # ホームタブ
+        self.page_edit.setFocus()
+        self.page_edit.selectAll()
+
+    def _cycle_tab(self, step: int) -> None:
+        n = self.tabs.count()
+        if n > 1:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() + step) % n)
 
     def _new_tab(self) -> "DocTab":
         """新しいドキュメントタブを作り、ビューワー/整理画面のシグナルを接続する。"""
@@ -890,6 +946,9 @@ class MainWindow(QMainWindow):
         org.split_requested.connect(self.split_pdf)
         org.export_images_requested.connect(self._export_indices_images)
         org.page_activated.connect(self._jump_from_organizer)
+        org.insert_requested.connect(self._insert_from_organizer)
+        org.properties_requested.connect(lambda: self.act_metadata.trigger())
+        org.security_requested.connect(lambda: self.act_protect.trigger())
         dark = self.act_dark.isChecked()
         pv.set_canvas_color(theme.canvas_color(dark))
         org.apply_theme(dark)
@@ -1301,6 +1360,17 @@ class MainWindow(QMainWindow):
 
     # --- 検索 ----------------------------------------------------------
     def _focus_search(self) -> None:
+        """検索ポップアップを表示してフォーカスする（Ctrl+F / 検索ボタン）。"""
+        pop = self.search_popup
+        if not pop.isVisible():
+            # メインウィンドウ右上（リボンの下あたり）に出す
+            geo = self.geometry()
+            ribbon_h = self.ribbon.height() if hasattr(self, "ribbon") else 96
+            pop.adjustSize()
+            pop.move(geo.right() - pop.width() - 48, geo.top() + ribbon_h + 48)
+            pop.show()
+        pop.raise_()
+        pop.activateWindow()
         self.search_edit.setFocus()
         self.search_edit.selectAll()
 
@@ -1580,87 +1650,57 @@ class MainWindow(QMainWindow):
         lay.addWidget(box)
         dlg.exec()
 
-    # 印刷サイズモード
-    PRINT_ACTUAL, PRINT_FIT, PRINT_SHRINK, PRINT_CUSTOM = range(4)
-
-    def _ask_print_size(self) -> tuple | None:
-        """Adobe 風の印刷サイズ指定ダイアログ。(mode, scale) か None を返す。"""
-        from PySide6.QtWidgets import (
-            QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QLabel,
-        )
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("印刷 — サイズ")
-        form = QFormLayout(dlg)
-        info = QLabel(
-            "厚労省の様式など、決まった寸法で印刷する場合は「実際のサイズ」を選んでください。")
-        info.setWordWrap(True)
-        form.addRow(info)
-        combo = QComboBox()
-        combo.addItems([
-            "実際のサイズ (100%)",
-            "ページに合わせる",
-            "特大ページを縮小",
-            "カスタム倍率",
-        ])
-        combo.setCurrentIndex(int(self.settings.value("print_mode", self.PRINT_ACTUAL, int)))
-        form.addRow("印刷サイズ:", combo)
-        scale = QDoubleSpinBox()
-        scale.setRange(10.0, 400.0)
-        scale.setValue(float(self.settings.value("print_scale", 100.0, float)))
-        scale.setSuffix(" %")
-        form.addRow("倍率:", scale)
-
-        def _sync():
-            scale.setEnabled(combo.currentIndex() == self.PRINT_CUSTOM)
-
-        combo.currentIndexChanged.connect(_sync)
-        _sync()
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
-                              | QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(dlg.accept)
-        bb.rejected.connect(dlg.reject)
-        form.addRow(bb)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return None
-        mode = combo.currentIndex()
-        self.settings.setValue("print_mode", mode)
-        self.settings.setValue("print_scale", scale.value())
-        return mode, scale.value() / 100.0
-
     def print_document(self) -> None:
+        """Adobe 風の印刷ダイアログ（プレビュー付き）で印刷する。"""
         if not self.doc.is_open:
             return
-        chosen = self._ask_print_size()
-        if chosen is None:
+        from PySide6.QtPrintSupport import QPrinterInfo
+
+        from .print_dialog import (
+            SIZE_ACTUAL, SIZE_CUSTOM, SIZE_FIT, SIZE_SHRINK, PrintDialog,
+        )
+
+        dlg = PrintDialog(self.doc, self.page_view.index, self.settings, self)
+        if dlg.exec() != PrintDialog.DialogCode.Accepted:
             return
-        mode, custom_scale = chosen
+        opt = dlg.options()
 
-        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-        dialog = QPrintDialog(printer, self)
-        dialog.setOption(QPrintDialog.PrintDialogOption.PrintPageRange, True)
-        dialog.setOption(QPrintDialog.PrintDialogOption.PrintCurrentPage, True)
-        if dialog.exec() != QPrintDialog.DialogCode.Accepted:
-            return
+        # プリンタを構成
+        info = QPrinterInfo.printerInfo(opt["printer"])
+        printer = (QPrinter(info, QPrinter.PrinterMode.HighResolution)
+                   if not info.isNull() else QPrinter(QPrinter.PrinterMode.HighResolution))
+        printer.setCopyCount(opt["copies"])
+        if opt["grayscale"]:
+            printer.setColorMode(QPrinter.ColorMode.GrayScale)
+        if opt["orientation"] == "landscape":
+            from PySide6.QtGui import QPageLayout
+            printer.setPageOrientation(QPageLayout.Orientation.Landscape)
 
-        from PySide6.QtCore import QRectF
-        from PySide6.QtGui import QPainter
-
-        # 印刷対象ページ（印刷範囲を反映）
+        # 対象ページ
         total = self.doc.page_count
-        if printer.printRange() == QPrinter.PrintRange.PageRange:
-            pages = list(range(printer.fromPage() - 1, printer.toPage()))
-        elif printer.printRange() == QPrinter.PrintRange.CurrentPage:
+        if opt["page_mode"] == "current":
             pages = [self.page_view.index]
+        elif opt["page_mode"] == "range":
+            try:
+                pages = _parse_ranges(opt["range_text"], total)
+            except ValueError as exc:
+                QMessageBox.information(self, "入力エラー", str(exc))
+                return
         else:
             pages = list(range(total))
         pages = [i for i in pages if 0 <= i < total]
         if not pages:
             return
 
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QPainter
+
         res = printer.resolution() or 300           # プリンタの dpi
         render_dpi = min(res, 300)                   # 描画は 300dpi で頭打ち（高速・高画質）
         zoom = render_dpi / 72.0
+        size_mode = opt["size_mode"]
+        custom_scale = opt["custom_scale"]
+        auto_rotate = opt["orientation"] == "auto"
 
         painter = QPainter(printer)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
@@ -1677,28 +1717,40 @@ class MainWindow(QMainWindow):
                     return
                 if n > 0:
                     printer.newPage()
-                # ページの実寸(pt) → 実際のサイズでの紙面ピクセル数（1pt = 1/72inch）
+                # ページの実寸(pt) → 紙面ピクセル数（1pt = 1/72inch）
                 w_pt, h_pt = self.doc.page_pixel_size(i, 1.0)
                 nat_w = w_pt / 72.0 * res
                 nat_h = h_pt / 72.0 * res
                 if nat_w <= 0 or nat_h <= 0:
                     continue
-                fit = min(page_rect.width() / nat_w, page_rect.height() / nat_h)
-                if mode == self.PRINT_ACTUAL:
+                # 向き=自動: 内容と用紙の縦横が食い違うときは内容を 90° 回して印刷
+                rotate = auto_rotate and (
+                    (nat_w > nat_h) != (page_rect.width() > page_rect.height()))
+                eff_w, eff_h = (nat_h, nat_w) if rotate else (nat_w, nat_h)
+                fit = min(page_rect.width() / eff_w, page_rect.height() / eff_h)
+                if size_mode == SIZE_ACTUAL:
                     s = 1.0
-                elif mode == self.PRINT_FIT:
+                elif size_mode == SIZE_FIT:
                     s = fit
-                elif mode == self.PRINT_SHRINK:
+                elif size_mode == SIZE_SHRINK:
                     s = min(1.0, fit)
-                else:  # PRINT_CUSTOM
+                else:  # SIZE_CUSTOM
                     s = custom_scale
-                tgt_w = nat_w * s
-                tgt_h = nat_h * s
+                tgt_w = eff_w * s
+                tgt_h = eff_h * s
                 x = page_rect.left() + (page_rect.width() - tgt_w) / 2
                 y = page_rect.top() + (page_rect.height() - tgt_h) / 2
                 pix = self.doc.render_page(i, zoom=zoom)
-                painter.drawPixmap(QRectF(x, y, tgt_w, tgt_h), pix,
-                                   QRectF(0, 0, pix.width(), pix.height()))
+                src = QRectF(0, 0, pix.width(), pix.height())
+                if rotate:
+                    painter.save()
+                    painter.translate(x + tgt_w / 2, y + tgt_h / 2)
+                    painter.rotate(90)
+                    painter.drawPixmap(
+                        QRectF(-tgt_h / 2, -tgt_w / 2, tgt_h, tgt_w), pix, src)
+                    painter.restore()
+                else:
+                    painter.drawPixmap(QRectF(x, y, tgt_w, tgt_h), pix, src)
             progress.setValue(len(pages))
         finally:
             if painter.isActive():
@@ -1739,7 +1791,9 @@ class MainWindow(QMainWindow):
             self.act_compact.setChecked(True)  # toggled で適用
         # ツールバーの表示/非表示（折りたたみ）を復元
         self.annot_toolbar.setVisible(self.settings.value("annot_bar", True, bool))
-        self.search_toolbar.setVisible(self.settings.value("search_bar", True, bool))
+        # ドック（ページ一覧/しおり）の表示状態を復元（前回消していたら消したまま）
+        self.page_dock.setVisible(self.settings.value("page_dock_visible", True, bool))
+        self.toc_dock.setVisible(self.settings.value("toc_dock_visible", True, bool))
         self._rebuild_recent_menu()
 
     def _save_settings(self) -> None:
@@ -1747,7 +1801,9 @@ class MainWindow(QMainWindow):
         self.settings.setValue("dark", self.act_dark.isChecked())
         self.settings.setValue("compact", self.act_compact.isChecked())
         self.settings.setValue("annot_bar", self.annot_toolbar.isVisible())
-        self.settings.setValue("search_bar", self.search_toolbar.isVisible())
+        # ドックの表示状態（タブ化で裏に隠れていても「表示中」として扱う）
+        self.settings.setValue("page_dock_visible", not self.page_dock.isHidden())
+        self.settings.setValue("toc_dock_visible", not self.toc_dock.isHidden())
         if hasattr(self, "ribbon"):
             self.settings.setValue("ribbon_collapsed", self.ribbon.is_collapsed())
 
@@ -2053,18 +2109,53 @@ class MainWindow(QMainWindow):
     def merge_pdf(self) -> None:
         if not self.doc.is_open:
             return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "末尾に統合する PDF を選択", "", "PDF ファイル (*.pdf)"
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "末尾に統合する PDF を選択（複数可）", self._last_dir(),
+            "PDF ファイル (*.pdf)"
         )
-        if not path:
+        if not paths:
             return
+        total = 0
         try:
-            self.doc.insert_pdf(path)  # 末尾に追加
+            for path in paths:  # 選んだ順に末尾へ追加
+                total += self.doc.insert_pdf(path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "エラー", f"統合できませんでした:\n{exc}")
-            return
+            if not total:
+                return
         self._reload(self.doc.page_count - 1)
-        self.statusBar().showMessage("PDF を末尾に統合しました", 3000)
+        self.statusBar().showMessage(
+            f"{len(paths)} ファイル（{total} ページ）を末尾に統合しました", 4000)
+
+    def _insert_from_organizer(self, kind: str, at: int) -> None:
+        """ページ整理の「挿入」。kind='file'|'blank'、at=挿入位置。"""
+        if not self.doc.is_open:
+            return
+        at = max(0, min(at, self.doc.page_count))
+        if kind == "blank":
+            self.doc.insert_blank_page(at)
+            self._reload(at)
+            self.statusBar().showMessage("白紙ページを挿入しました", 3000)
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "挿入する PDF を選択（複数可）", self._last_dir(),
+            "PDF ファイル (*.pdf)"
+        )
+        if not paths:
+            return
+        pos = at
+        total = 0
+        try:
+            for path in paths:
+                n = self.doc.insert_pdf(path, at=pos)
+                pos += n
+                total += n
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "エラー", f"挿入できませんでした:\n{exc}")
+            if not total:
+                return
+        self._reload(at)
+        self.statusBar().showMessage(f"{total} ページを挿入しました", 3000)
 
     def extract_pages(self) -> None:
         if not self.doc.is_open:
@@ -2285,6 +2376,22 @@ class MainWindow(QMainWindow):
     def save(self) -> None:
         if not self.doc.is_open:
             return
+        # 上書き保存の確認（「次回から表示しない」を選べる）
+        if self.settings.value("confirm_overwrite", True, bool) and self.doc.path:
+            from PySide6.QtWidgets import QCheckBox
+            box = QMessageBox(self)
+            box.setWindowTitle("上書き保存")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(f"元のファイルに上書き保存します:\n{self.doc.path}\n\nよろしいですか？")
+            box.setStandardButtons(QMessageBox.StandardButton.Yes
+                                   | QMessageBox.StandardButton.No)
+            box.setDefaultButton(QMessageBox.StandardButton.Yes)
+            cb = QCheckBox("次回から表示しない")
+            box.setCheckBox(cb)
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                return
+            if cb.isChecked():
+                self.settings.setValue("confirm_overwrite", False)
         # Documents 配下などはフォルダー保護で上書きが弾かれることがあるため、
         # 失敗したら名前を付けて保存にフォールバックする。
         try:
