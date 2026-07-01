@@ -347,8 +347,18 @@ class PageView(QScrollArea):
         self._auto_timer.setInterval(16)  # 約60fps
         self._auto_timer.timeout.connect(self._auto_scroll_tick)
         self.viewport().installEventFilter(self)
+        # キーボード操作（矢印でページ送り/スクロール）を受けられるように
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+
+    # --- スクロール位置（タブ切替時の記憶に使う）------------------------
+    def scroll_value(self) -> int:
+        return self.verticalScrollBar().value()
+
+    def set_scroll_value(self, value: int) -> None:
+        bar = self.verticalScrollBar()
+        bar.setValue(max(0, min(value, bar.maximum())))
 
     # --- 公開 API -------------------------------------------------------
     def set_document(self, doc: PdfDocument) -> None:
@@ -836,6 +846,19 @@ class PageView(QScrollArea):
             return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.has_selection():
             self.delete_selection()
+            return
+        key = event.key()
+        # ← → でページ送り、↑ ↓ でスクロール
+        if key == Qt.Key.Key_Right:
+            self.set_page(self._index + 1)
+            return
+        if key == Qt.Key.Key_Left:
+            self.set_page(self._index - 1)
+            return
+        if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
+            bar = self.verticalScrollBar()
+            step = max(bar.singleStep(), 60)
+            bar.setValue(bar.value() + (step if key == Qt.Key.Key_Down else -step))
             return
         super().keyPressEvent(event)
 

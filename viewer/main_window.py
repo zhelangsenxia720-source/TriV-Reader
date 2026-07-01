@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -117,6 +117,7 @@ class MainWindow(QMainWindow):
         dock.setWidget(self.thumbnails)
         dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        self.page_dock = dock  # 表示メニューから再表示できるよう参照を保持
 
         # しおり（目次）ドック：ページドックとタブで重ねる
         self.toc_dock = TocDock(self)
@@ -388,6 +389,15 @@ class MainWindow(QMainWindow):
         m_view = mb.addMenu("表示(&V)")
         m_view.addAction(self.act_dark)
         m_view.addAction(self.act_compact)
+        m_view.addSeparator()
+        # 左のページ一覧ドックの表示/非表示（消しても再表示できるように）
+        self.act_toggle_pagedock = self.page_dock.toggleViewAction()
+        self.act_toggle_pagedock.setText("ページ一覧を表示")
+        m_view.addAction(self.act_toggle_pagedock)
+        # しおり（目次）ドックの表示/非表示も表示メニューから
+        act_toggle_toc = self.toc_dock.toggleViewAction()
+        act_toggle_toc.setText("しおり一覧を表示")
+        m_view.addAction(act_toggle_toc)
         m_view.addSeparator()
         # 注釈バーの表示/非表示（折りたたみ）
         self.act_toggle_annotbar = self.annot_toolbar.toggleViewAction()
@@ -816,7 +826,16 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, _index: int) -> None:
         """アクティブタブが変わったら共有UI（サムネ/目次/状態）を同期する。"""
+        # 直前タブのスクロール位置を保存（タブ切替で先頭に戻らないように）
+        prev = getattr(self, "_active_doctab", None)
+        if isinstance(prev, DocTab):
+            try:
+                prev._saved_scroll = prev.page_view.scroll_value()
+            except Exception:  # noqa: BLE001
+                pass
+
         tab = self._active_tab()
+        self._active_doctab = tab
         if tab is None:
             self.center.setCurrentWidget(self.welcome)
             self._update_actions()
@@ -826,6 +845,10 @@ class MainWindow(QMainWindow):
         self.thumbnails.load(tab.doc)
         self.toc_dock.load(tab.doc.get_toc())
         self.thumbnails.select_page(tab.page_view.index)
+        # このタブで前回見ていたスクロール位置を復元（描画確定後に）
+        saved = getattr(tab, "_saved_scroll", 0)
+        if saved:
+            QTimer.singleShot(0, lambda t=tab, v=saved: t.page_view.set_scroll_value(v))
         # 整理トグルをこのタブの状態に同期
         self.act_organize.blockSignals(True)
         self.act_organize.setChecked(tab.currentWidget() is tab.organizer)
@@ -856,9 +879,14 @@ class MainWindow(QMainWindow):
             elif ret == QMessageBox.StandardButton.Cancel:
                 return
         tab.doc.close()
+        if getattr(self, "_active_doctab", None) is tab:
+            self._active_doctab = None
         self.tabs.removeTab(index)
         tab.deleteLater()
         if self.tabs.count() == 0:
+            # 最後のタブを閉じたら左のサムネ/しおり表示も消す（表示が残らないように）
+            self.thumbnails.load(self._empty_doc)
+            self.toc_dock.load([])
             self.center.setCurrentWidget(self.welcome)
             self._update_actions()
             self._update_title()
@@ -1362,25 +1390,45 @@ class MainWindow(QMainWindow):
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         if QPrintDialog(printer, self).exec() != QPrintDialog.DialogCode.Accepted:
             return
+        from PySide6.QtCore import QRectF
         from PySide6.QtGui import QPainter
+
+        # 印刷用の描画DPI。プリンタ解像度に合わせつつ 300dpi で頭打ちにする。
+        # （従来は 144dpi 相当で描画→プリンタ面へ拡大していたため遅く・ぼやけていた）
+        target_dpi = min(printer.resolution() or 300, 300)
+        zoom = target_dpi / 72.0
+
         painter = QPainter(printer)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
+        count = self.doc.page_count
+        progress = QProgressDialog("印刷を準備中…", "キャンセル", 0, count, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(400)
         try:
-            for i in range(self.doc.page_count):
+            for i in range(count):
+                progress.setValue(i)
+                if progress.wasCanceled():
+                    painter.end()
+                    self.statusBar().showMessage("印刷をキャンセルしました", 3000)
+                    return
                 if i > 0:
                     printer.newPage()
-                # 高解像度で描画した各ページをプリンタ面に合わせて配置
-                pix = self.doc.render_page(i, zoom=2.0)
-                scaled = pix.scaled(
-                    int(page_rect.width()), int(page_rect.height()),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                x = (page_rect.width() - scaled.width()) / 2
-                y = (page_rect.height() - scaled.height()) / 2
-                painter.drawPixmap(int(x), int(y), scaled)
+                pix = self.doc.render_page(i, zoom=zoom)
+                # ページ枠にアスペクト比を保って収め、描画時に紙面へスケール（高速・高画質）
+                if pix.width() and pix.height():
+                    scale = min(page_rect.width() / pix.width(),
+                                page_rect.height() / pix.height())
+                    w = pix.width() * scale
+                    h = pix.height() * scale
+                    x = page_rect.left() + (page_rect.width() - w) / 2
+                    y = page_rect.top() + (page_rect.height() - h) / 2
+                    painter.drawPixmap(QRectF(x, y, w, h), pix,
+                                       QRectF(0, 0, pix.width(), pix.height()))
+            progress.setValue(count)
         finally:
-            painter.end()
+            if painter.isActive():
+                painter.end()
         self.statusBar().showMessage("印刷ジョブを送信しました", 3000)
 
     # --- 設定の永続化 / 最近のファイル / D&D --------------------------
@@ -2059,7 +2107,42 @@ class MainWindow(QMainWindow):
 
     # --- 終了確認 -------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
-        # トレイ常駐が有効なら、閉じる代わりにトレイへ隠す（次回起動を高速化）
+        # 通常の×でタブがあるときは「現在のタブ / 全て / キャンセル」を尋ねる。
+        # （トレイの「終了」からの呼び出し _force_quit ではダイアログを出さない）
+        if not self._force_quit and self.tabs.count() > 0:
+            box = QMessageBox(self)
+            box.setWindowTitle("ウィンドウを閉じる")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText("ウィンドウを閉じます。どうしますか？")
+            b_current = box.addButton("現在のタブを閉じる",
+                                      QMessageBox.ButtonRole.AcceptRole)
+            b_all = box.addButton("全てのタブを閉じる",
+                                  QMessageBox.ButtonRole.DestructiveRole)
+            b_cancel = box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(b_cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is None or clicked is b_cancel:
+                event.ignore()
+                return
+            if clicked is b_current:
+                idx = self.tabs.currentIndex()
+                if idx >= 0:
+                    self._close_tab(idx)  # 未保存確認は _close_tab 内で行う
+                event.ignore()            # ウィンドウ自体は残す
+                return
+            # b_all → このまま全タブを閉じる処理へ進む
+
+        # 全タブを閉じる（各タブの未保存は _close_tab が確認。中断されたら閉じない）
+        while self.tabs.count() > 0:
+            before = self.tabs.count()
+            self._close_tab(0)
+            if self.tabs.count() == before:  # 未保存確認でキャンセルされた
+                self._force_quit = False
+                event.ignore()
+                return
+
+        # トレイ常駐が有効で通常の×なら、終了せずトレイへ隠す（次回起動を高速化）
         if not self._force_quit and self._tray_resident_enabled():
             event.ignore()
             self.hide()
@@ -2074,29 +2157,6 @@ class MainWindow(QMainWindow):
                 )
             return
 
-        # --- 実終了処理 ---
-        # 未保存のタブがあれば確認
-        modified = [i for i in range(self.tabs.count())
-                    if isinstance(self.tabs.widget(i), DocTab)
-                    and self.tabs.widget(i).doc.is_open
-                    and self.tabs.widget(i).doc.modified]
-        if modified:
-            ret = QMessageBox.question(
-                self,
-                "未保存の変更",
-                f"{len(modified)} 個のタブに保存されていない変更があります。すべて保存しますか？",
-                QMessageBox.StandardButton.Save
-                | QMessageBox.StandardButton.Discard
-                | QMessageBox.StandardButton.Cancel,
-            )
-            if ret == QMessageBox.StandardButton.Cancel:
-                self._force_quit = False  # 終了をキャンセル → 常駐継続
-                event.ignore()
-                return
-            if ret == QMessageBox.StandardButton.Save:
-                for i in modified:
-                    self.tabs.setCurrentIndex(i)
-                    self.save()
         self._save_settings()
         if getattr(self, "tray", None) is not None:
             self.tray.hide()

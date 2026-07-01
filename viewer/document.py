@@ -27,7 +27,11 @@ class PdfDocument:
     # --- ライフサイクル -------------------------------------------------
     def open(self, path: str, password: str | None = None) -> None:
         self.close()
-        self._doc = fitz.open(path)
+        # ファイルをメモリに読み込んでから開く（ディスク上のファイルをロックしない）。
+        # これにより、開いたままでもエクスプローラでのリネーム/移動が可能になる。
+        with open(path, "rb") as f:
+            data = f.read()
+        self._doc = fitz.open(stream=data, filetype="pdf")
         self.path = path
         self.modified = False
         self._authenticated = not self._doc.needs_pass
@@ -872,7 +876,10 @@ class PdfDocument:
             self._doc.save(tmp, garbage=4, deflate=True)
             self._doc.close()
             os.replace(tmp, out_path)
-            self._doc = fitz.open(out_path)  # 置き換え後に開き直す
+            # 置き換え後もロックしないよう stream で開き直す
+            with open(out_path, "rb") as f:
+                data = f.read()
+            self._doc = fitz.open(stream=data, filetype="pdf")
         else:
             self._doc.save(out_path, garbage=4, deflate=True)
         self.path = out_path
