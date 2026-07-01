@@ -117,6 +117,12 @@ def main() -> int:
     exe_dir = dist if onefile else os.path.join(dist, name)
     exe = os.path.join(exe_dir, f"{name}.exe")
 
+    # 関連付けファイル用の「書類」アイコンを exe の隣に置く（関連付け登録が参照）
+    doc_ico = os.path.join(HERE, "assets", "pdf_doc.ico")
+    if os.path.exists(doc_ico):
+        import shutil
+        shutil.copy2(doc_ico, os.path.join(exe_dir, "pdf_doc.ico"))
+
     if "--portable" in sys.argv:
         # exe 隣にマーカーを置くとアプリがポータブルモード（設定/データを隣に保存）
         with open(os.path.join(exe_dir, "portable.ini"), "w", encoding="utf-8") as f:

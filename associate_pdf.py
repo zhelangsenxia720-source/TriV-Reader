@@ -40,16 +40,19 @@ def _set(key_path: str, name, value) -> None:
 
 
 def register(exe: str) -> None:
-    icon = f'"{exe}",0'
+    icon = f'"{exe}",0'  # アプリ起動アイコン
+    # 関連付けファイル（.pdf）は、アプリ起動用とは別の「書類」風アイコンにする
+    doc_ico = os.path.join(os.path.dirname(exe), "pdf_doc.ico")
+    file_icon = f'"{doc_ico}",0' if os.path.exists(doc_ico) else icon
     cmd = f'"{exe}" "%1"'
     classes = r"Software\Classes"
-    # ProgID（このアプリの "ファイルの種類"）
+    # ProgID（このアプリの "ファイルの種類"）: ファイルのアイコンは書類アイコン
     _set(rf"{classes}\{PROGID}", None, "PDF ドキュメント")
-    _set(rf"{classes}\{PROGID}\DefaultIcon", None, icon)
+    _set(rf"{classes}\{PROGID}\DefaultIcon", None, file_icon)
     _set(rf"{classes}\{PROGID}\shell\open\command", None, cmd)
     # 「プログラムから開く」候補に追加
     _set(rf"{classes}\.pdf\OpenWithProgids", PROGID, "")
-    # Applications にも登録（「別のプログラムを選択」に表示）
+    # Applications にも登録（「別のプログラムを選択」に表示）: こちらはアプリアイコン
     appkey = rf"{classes}\Applications\TriVReader.exe"
     _set(rf"{appkey}\shell\open\command", None, cmd)
     _set(rf"{appkey}\DefaultIcon", None, icon)

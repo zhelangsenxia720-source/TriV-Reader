@@ -75,9 +75,9 @@ Name: "{autodesktop}\TriV-Reader"; Filename: "{app}\{#MyAppExeName}"; Tasks: des
 
 [Registry]
 ; ── PDF 関連付け（HKCU・associate_pdf.py と同じ構成）──────────────
-; ProgID（このアプリの「ファイルの種類」）
+; ProgID（このアプリの「ファイルの種類」）。ファイルのアイコンは書類アイコン(pdf_doc.ico)
 Root: HKCU; Subkey: "Software\Classes\{#MyProgId}"; ValueType: string; ValueData: "PDF ドキュメント"; Flags: uninsdeletekey; Tasks: associate
-Root: HKCU; Subkey: "Software\Classes\{#MyProgId}\DefaultIcon"; ValueType: string; ValueData: "{app}\{#MyAppExeName},0"; Tasks: associate
+Root: HKCU; Subkey: "Software\Classes\{#MyProgId}\DefaultIcon"; ValueType: string; ValueData: "{app}\pdf_doc.ico,0"; Tasks: associate
 Root: HKCU; Subkey: "Software\Classes\{#MyProgId}\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Tasks: associate
 ; 「プログラムから開く」候補に追加
 Root: HKCU; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "{#MyProgId}"; ValueData: ""; Flags: uninsdeletevalue; Tasks: associate
