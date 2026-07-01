@@ -679,6 +679,19 @@ class MainWindow(QMainWindow):
             self.act_deskew: "📐", self.act_apply_redact: "✅",
             self.act_clear_annots: "🧹", self.act_highlight_all: "🖍",
             self.act_search_prev: "◀", self.act_search_next: "▶",
+            # リボン化にあたり残りのアクションにもアイコンを付与
+            self.act_form: "🖊", self.act_copy: "📋",
+            self.act_blank_page: "🗒", self.act_duplicate_page: "📑",
+            self.act_autocrop: "⬚", self.act_page_numbers: "🔢",
+            self.act_header_footer: "📃", self.act_watermark: "💧",
+            self.act_export_text: "📄", self.act_export_html: "🌐",
+            self.act_metadata: "🏷", self.act_batch: "📚", self.act_diff: "🔀",
+            self.act_protect: "🔒", self.act_unlock: "🔓",
+            self.act_compress: "🗜", self.act_export_pdfa: "🅰",
+            self.act_dark: "🌙", self.act_add_bookmark: "🔖",
+            self.act_edit_toc: "📇", self.act_check_update: "🔄",
+            self.act_set_update_url: "⚙", self.act_about: "ℹ",
+            self.act_toggle_pagedock: "▤",
         }
         for act, g in glyphs.items():
             act.setIcon(self._glyph_icon(g))

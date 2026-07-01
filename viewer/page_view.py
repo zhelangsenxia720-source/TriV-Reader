@@ -214,6 +214,16 @@ class _PageLabel(QLabel):
         super().contextMenuEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        # 連続した中クリックの2回目はダブルクリックとして届くため、ここでも処理する
+        if self._view._auto_active:
+            self._view._stop_autoscroll()
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.MiddleButton:
+            vp = self._view.viewport().mapFromGlobal(event.globalPosition().toPoint())
+            self._view._start_autoscroll(vp)
+            event.accept()
+            return
         if self._view.tool == TOOL_NONE and event.button() == Qt.MouseButton.LeftButton:
             pos = event.position().toPoint()
             xref = self._view.hit_annot(self._index, pos)
@@ -895,7 +905,8 @@ class PageView(QScrollArea):
     def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt 命名)
         if obj is self.viewport():
             et = event.type()
-            if et == QEvent.Type.MouseButtonPress:
+            # 押下・ダブルクリックの両方を拾う（連続中クリックの取りこぼし対策）
+            if et in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
                 if self._auto_active:
                     # オートスクロール中はどのボタンでも停止（ブラウザと同様）
                     self._stop_autoscroll()
