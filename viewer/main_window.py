@@ -133,6 +133,7 @@ class MainWindow(QMainWindow):
         self._build_annotation_toolbar()
         self._build_search_toolbar()
         self._build_menubar()
+        self._tighten_chrome()  # ツールバー/メニューの余白を詰める
         self._connect()
         self._polish_actions()
         self._apply_lite_mode()
@@ -579,10 +580,25 @@ class MainWindow(QMainWindow):
             if g:
                 act.setIcon(self._glyph_icon(g))
 
+    # 通常時のツールバー余白（既定でも詰めて縦の無駄を減らす）
+    _TOOLBAR_QSS = (
+        "QToolBar { padding: 0px; spacing: 2px; margin: 0px; border: 0px; }"
+        "QToolButton { padding: 3px 7px; margin: 0px; border-radius: 4px; }"
+    )
+
+    def _tighten_chrome(self) -> None:
+        """ツールバー・メニューバーの余白を詰める（既定状態で適用）。"""
+        for tb in (self.main_toolbar, self.annot_toolbar, self.search_toolbar):
+            tb.setContentsMargins(0, 0, 0, 0)
+            tb.setStyleSheet(self._TOOLBAR_QSS)
+        self.menuBar().setStyleSheet(
+            "QMenuBar { padding: 0px; } QMenuBar::item { padding: 3px 9px; }"
+        )
+
     def _set_compact(self, on: bool) -> None:
         """ツールバーをアイコンのみ（省スペース）/ 文字ラベル に切り替える。
 
-        コンパクト時はボタン・ツールバーの余白も詰めて縦幅をさらに小さくする。
+        コンパクト時はボタン・ツールバーの余白をさらに詰めて縦幅を小さくする。
         """
         style = (Qt.ToolButtonStyle.ToolButtonIconOnly if on
                  else Qt.ToolButtonStyle.ToolButtonTextOnly)
@@ -595,7 +611,8 @@ class MainWindow(QMainWindow):
             tb.setToolButtonStyle(style)
             tb.setIconSize(QSize(18, 18) if on else QSize(16, 16))
             tb.setContentsMargins(0, 0, 0, 0)
-            tb.setStyleSheet(compact_qss if on else "")
+            # コンパクト解除時は既定の詰めQSSに戻す（空文字だと余白が広がる）
+            tb.setStyleSheet(compact_qss if on else self._TOOLBAR_QSS)
 
     def _refresh_color_icon(self) -> None:
         """色ボタンに現在の色のアイコンを表示する。"""
