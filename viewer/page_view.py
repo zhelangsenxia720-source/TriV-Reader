@@ -6,7 +6,15 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QCursor, QKeySequence, QPainter, QPen
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QPolygon,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -916,17 +924,53 @@ class PageView(QScrollArea):
                     return True
         return super().eventFilter(obj, event)
 
+    def _auto_marker_widget(self) -> QLabel:
+        """オートスクロールの起点マーカー（丸に上下矢印）。有効中の目印。"""
+        if getattr(self, "_auto_marker", None) is not None:
+            return self._auto_marker
+        size = 34
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor(255, 255, 255, 235))
+        p.setPen(QPen(QColor(80, 80, 80), 2))
+        p.drawEllipse(QRect(2, 2, size - 4, size - 4))
+        c = size // 2
+        p.setBrush(QColor(60, 60, 60))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawPolygon(QPolygon([QPoint(c, 6), QPoint(c - 5, 13), QPoint(c + 5, 13)]))
+        p.drawPolygon(QPolygon([QPoint(c, size - 6), QPoint(c - 5, size - 13),
+                                QPoint(c + 5, size - 13)]))
+        # 中央の点
+        p.setBrush(QColor(60, 60, 60))
+        p.drawEllipse(QRect(c - 2, c - 2, 4, 4))
+        p.end()
+        lbl = QLabel(self.viewport())
+        lbl.setPixmap(pm)
+        lbl.setFixedSize(size, size)
+        lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        lbl.hide()
+        self._auto_marker = lbl
+        return lbl
+
     def _start_autoscroll(self, pos: QPoint) -> None:
         # pos はビューポート座標。以後の移動量はカーソル位置(QCursor)で判定するので
         # ラベルがビューポートを覆っていても確実に動く。
         self._auto_active = True
         self._auto_origin = pos
+        marker = self._auto_marker_widget()
+        marker.move(pos.x() - marker.width() // 2, pos.y() - marker.height() // 2)
+        marker.show()
+        marker.raise_()
         self.viewport().setCursor(Qt.CursorShape.SizeVerCursor)
         self._auto_timer.start()
 
     def _stop_autoscroll(self) -> None:
         self._auto_active = False
         self._auto_timer.stop()
+        if getattr(self, "_auto_marker", None) is not None:
+            self._auto_marker.hide()
         self.viewport().unsetCursor()
 
     def _auto_scroll_tick(self) -> None:

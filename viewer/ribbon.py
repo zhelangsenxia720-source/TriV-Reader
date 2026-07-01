@@ -2,24 +2,16 @@
 
 Office / Foxit などで一般的な「リボン」レイアウトを、このアプリの既存 QAction を
 そのまま流用して組み立てる。各ボタンは QToolButton.setDefaultAction で action に
-束ねるため、有効/無効・チェック状態・テキストは action 側と自動同期する。
+束ねるため、有効/無効・チェック状態は action 側と自動同期する。
 
-アイコンは Windows 標準のアイコンフォント（Segoe Fluent Icons / Segoe MDL2
-Assets）のグリフを描画して使う（モノクロで Word/Excel 風）。フォントやグリフが
-無い環境ではアイコン無し（テキストのみ）に自動フォールバックする。
+表示ルール（バランス重視）:
+- big ボタン: 幅はラベルに合わせて自動（文字は見切れない）。主要機能のみに使う。
+- stack: 小ボタンを縦3段で整列。列内は同じ幅に揃う。
+- 長い action 名は action.setIconText("短い名前") でリボン用の短縮表示にできる。
 """
 from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import (
-    QColor,
-    QFont,
-    QFontInfo,
-    QFontMetrics,
-    QIcon,
-    QPainter,
-    QPixmap,
-)
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -31,47 +23,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-_ICON_FONT_NAME: str | None = None
-_ICON_FONT_CHECKED = False
 
-
-def _icon_font_name() -> str | None:
-    """使用できるアイコンフォント名を1回だけ判定してキャッシュする。"""
-    global _ICON_FONT_NAME, _ICON_FONT_CHECKED
-    if _ICON_FONT_CHECKED:
-        return _ICON_FONT_NAME
-    _ICON_FONT_CHECKED = True
-    for name in ("Segoe Fluent Icons", "Segoe MDL2 Assets"):
-        f = QFont(name)
-        if QFontInfo(f).family() == name:
-            _ICON_FONT_NAME = name
-            break
-    return _ICON_FONT_NAME
-
-
-def sym_icon(glyph: str, px: int = 32, color: str = "#3c4043") -> QIcon:
-    """アイコンフォントのグリフを描画して QIcon を返す。無ければ空アイコン。"""
-    name = _icon_font_name()
-    if not name or not glyph:
-        return QIcon()
-    font = QFont(name)
-    font.setPixelSize(int(px * 0.66))
-    if not QFontMetrics(font).inFontUcs4(ord(glyph[0])):
-        return QIcon()  # このグリフはフォントに無い → テキストのみ
-    pm = QPixmap(px, px)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-    p.setFont(font)
-    p.setPen(QColor(color))
-    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, glyph)
-    p.end()
-    return QIcon(pm)
+def _apply_ribbon_text(btn: QToolButton, action) -> None:
+    """リボン用の短縮ラベル（iconText）があればボタンに反映する。"""
+    it = action.iconText()
+    if it and it != action.text():
+        btn.setText(it)
 
 
 class RibbonGroup(QWidget):
-    """リボン内の1グループ（下部にグループ名、上部にボタン）。"""
+    """リボン内の1グループ（上部にボタン、下部にグループ名）。"""
 
     def __init__(self, title: str) -> None:
         super().__init__()
@@ -91,12 +52,16 @@ class RibbonGroup(QWidget):
     def add_action(self, action, big: bool = False) -> QToolButton:
         btn = QToolButton()
         btn.setDefaultAction(action)
+        _apply_ribbon_text(btn, action)
         btn.setAutoRaise(True)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         if big:
+            # 幅は文字に合わせて自動（固定幅にしない＝見切れ防止）
             btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
-            btn.setIconSize(QSize(26, 26))
-            btn.setFixedSize(QSize(64, 64))
+            btn.setIconSize(QSize(24, 24))
+            btn.setFixedHeight(62)
+            fm = btn.fontMetrics()
+            btn.setMinimumWidth(max(56, fm.horizontalAdvance(btn.text()) + 16))
         else:
             btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             btn.setIconSize(QSize(16, 16))
@@ -105,22 +70,25 @@ class RibbonGroup(QWidget):
         return btn
 
     def add_stack(self, actions: list) -> None:
-        """小さなアイコン＋文字ボタンを縦に3個ずつ積む（省スペース・整列）。"""
+        """小ボタンを縦3段で積む。列内のボタン幅は自動で揃う。"""
         col = None
         for i, act in enumerate(actions):
             if i % 3 == 0:
                 col = QVBoxLayout()
                 col.setContentsMargins(0, 0, 0, 0)
                 col.setSpacing(1)
+                col.setAlignment(Qt.AlignmentFlag.AlignTop)
                 self._row.addLayout(col)
             btn = QToolButton()
             btn.setDefaultAction(act)
+            _apply_ribbon_text(btn, act)
             btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             btn.setIconSize(QSize(16, 16))
             btn.setAutoRaise(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            # 列の幅いっぱいに広げる → 同列のボタン幅が揃って整って見える
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            btn.setMinimumWidth(96)
+            btn.setMinimumHeight(24)
             col.addWidget(btn)
 
     def add_widget(self, w: QWidget) -> None:
@@ -131,15 +99,52 @@ class RibbonGroup(QWidget):
 
 
 class Ribbon(QTabWidget):
-    """タブごとにグループを並べるリボン本体。"""
+    """タブごとにグループを並べるリボン本体。折りたたみ対応。"""
+
+    EXPANDED_HEIGHT = 118
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setDocumentMode(True)
         self.tabBar().setExpanding(False)
-        self.setMaximumHeight(120)
+        self.setMaximumHeight(self.EXPANDED_HEIGHT)
         self.setObjectName("ribbon")
+        self._collapsed = False
 
+        # 右上の折りたたみボタン（Office の ^ と同じ）
+        btn = QToolButton()
+        btn.setText("⌃")
+        btn.setAutoRaise(True)
+        btn.setToolTip("リボンを折りたたみ / 展開（タブをダブルクリックでも可）")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(self.toggle_collapsed)
+        self._collapse_btn = btn
+        self.setCornerWidget(btn, Qt.Corner.TopRightCorner)
+
+        # タブのダブルクリックで折りたたみ切替、折りたたみ中のクリックで展開
+        self.tabBarDoubleClicked.connect(lambda _i: self.toggle_collapsed())
+        self.tabBarClicked.connect(self._expand_if_collapsed)
+
+    # --- 折りたたみ -----------------------------------------------------
+    def is_collapsed(self) -> bool:
+        return self._collapsed
+
+    def set_collapsed(self, on: bool) -> None:
+        self._collapsed = on
+        self._collapse_btn.setText("⌄" if on else "⌃")
+        if on:
+            self.setMaximumHeight(self.tabBar().sizeHint().height() + 3)
+        else:
+            self.setMaximumHeight(self.EXPANDED_HEIGHT)
+
+    def toggle_collapsed(self) -> None:
+        self.set_collapsed(not self._collapsed)
+
+    def _expand_if_collapsed(self, _index: int) -> None:
+        if self._collapsed:
+            self.set_collapsed(False)
+
+    # --- ページ / グループ ----------------------------------------------
     def add_page(self, name: str) -> QWidget:
         page = QWidget()
         row = QHBoxLayout(page)

@@ -126,6 +126,18 @@ class MainWindow(QMainWindow):
         self.tabifyDockWidget(dock, self.toc_dock)
         dock.raise_()
 
+        # ドックの方針: 基本はウィンドウ内。×で閉じられる。外窓（フローティング）は
+        # ドラッグで外へ出したときだけ。再表示時は必ずウィンドウ内に戻す。
+        feat = (QDockWidget.DockWidgetFeature.DockWidgetClosable
+                | QDockWidget.DockWidgetFeature.DockWidgetMovable
+                | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+        for d in (dock, self.toc_dock):
+            d.setFeatures(feat)
+            d.setFloating(False)  # 起動時は必ずウィンドウ内
+            # 非表示→再表示（表示メニュー等）のとき、外窓のままなら中へ戻す
+            d.visibilityChanged.connect(
+                lambda vis, dd=d: (vis and dd.isFloating() and dd.setFloating(False)))
+
         self.page_label = QLabel("  ページ: - / -  ")
         self.statusBar().addPermanentWidget(self.page_label)
 
@@ -483,9 +495,23 @@ class MainWindow(QMainWindow):
         既存の QAction / ウィジェットをそのまま流用し、従来のメニューバー・
         ツールバーは隠す。ボタンは action に束ねるので状態は自動同期する。
         """
+        from PySide6.QtGui import QIntValidator
         from PySide6.QtWidgets import QToolButton
 
         from .ribbon import RIBBON_QSS, Ribbon
+
+        # リボン用の短縮ラベル（長い action 名は iconText で短く表示。見切れ防止）
+        short = {
+            self.act_save: "保存", self.act_save_as: "別名保存",
+            self.act_copy: "コピー", self.act_clear_annots: "注釈を全消去",
+            self.act_page_numbers: "ページ番号", self.act_toggle_pagedock: "ページ一覧",
+            self.act_prev: "前へ", self.act_next: "次へ",
+            self.act_zoom_in: "拡大", self.act_zoom_out: "縮小",
+            self.act_rotate_left: "左回転", self.act_rotate_right: "右回転",
+            self.act_search_prev: "前", self.act_search_next: "次",
+        }
+        for act, text in short.items():
+            act.setIconText(text)
 
         r = Ribbon(self)
         self.ribbon = r
@@ -494,29 +520,37 @@ class MainWindow(QMainWindow):
         p = r.add_page("ホーム")
         g = r.add_group(p, "ファイル")
         g.add_action(self.act_open, big=True)
+        g.add_stack([self.act_save, self.act_save_as, self.act_print])
         recent_btn = QToolButton()
-        recent_btn.setText("最近使用 ▾")
+        recent_btn.setText("最近 ▾")
         recent_btn.setAutoRaise(True)
         recent_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         recent_btn.setMenu(self.recent_menu)
         g.add_widget(recent_btn)
-        g.add_stack([self.act_save, self.act_save_as, self.act_print])
         g = r.add_group(p, "ページ移動")
-        g.add_action(self.act_prev, big=True)
-        g.add_action(self.act_next, big=True)
+        g.add_stack([self.act_prev, self.act_next])
+        # 現在ページの直接入力（例: 8 + Enter で 8 ページへ）
+        self.page_edit = QLineEdit()
+        self.page_edit.setFixedWidth(46)
+        self.page_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.page_edit.setValidator(QIntValidator(1, 999999, self.page_edit))
+        self.page_edit.setToolTip("ページ番号を入力して Enter でジャンプ")
+        self.page_edit.returnPressed.connect(self._jump_to_page_edit)
+        self.page_total_label = QLabel(" / -")
+        g.add_widget(self.page_edit)
+        g.add_widget(self.page_total_label)
         g = r.add_group(p, "表示倍率")
         g.add_stack([self.act_zoom_in, self.act_zoom_out, self.act_fit])
         g.add_widget(self.zoom_slider)
         g.add_widget(self.zoom_combo)
         g = r.add_group(p, "回転")
-        g.add_action(self.act_rotate_left, big=True)
-        g.add_action(self.act_rotate_right, big=True)
+        g.add_stack([self.act_rotate_left, self.act_rotate_right])
         g = r.add_group(p, "検索")
+        self.search_edit.setMaximumWidth(200)
         g.add_widget(self.search_edit)
-        g.add_action(self.act_search_prev)
-        g.add_action(self.act_search_next)
+        g.add_stack([self.act_search_prev, self.act_search_next,
+                     self.act_highlight_all])
         g.add_widget(self.search_count_label)
-        g.add_action(self.act_highlight_all)
         r.end_page(p)
 
         # ── 注釈 ────────────────────────────────────────────────
@@ -537,11 +571,11 @@ class MainWindow(QMainWindow):
         g.add_action(self.act_organize, big=True)
         g.add_action(self.act_form, big=True)
         g = r.add_group(p, "ページ操作")
-        g.add_stack([self.act_delete, self.act_merge, self.act_extract, self.act_split])
-        g = r.add_group(p, "挿入・調整")
-        g.add_stack([self.act_blank_page, self.act_duplicate_page, self.act_autocrop])
-        g = r.add_group(p, "装飾")
-        g.add_stack([self.act_page_numbers, self.act_header_footer, self.act_watermark])
+        g.add_stack([self.act_delete, self.act_merge, self.act_extract,
+                     self.act_split, self.act_blank_page, self.act_duplicate_page])
+        g = r.add_group(p, "調整・装飾")
+        g.add_stack([self.act_autocrop, self.act_page_numbers,
+                     self.act_header_footer, self.act_watermark])
         r.end_page(p)
 
         # ── 変換 ────────────────────────────────────────────────
@@ -549,32 +583,29 @@ class MainWindow(QMainWindow):
         g = r.add_group(p, "画像")
         g.add_stack([self.act_to_images, self.act_from_images, self.act_add_images])
         g = r.add_group(p, "文字認識")
-        g.add_action(self.act_ocr, big=True)
-        g.add_action(self.act_deskew, big=True)
+        g.add_stack([self.act_ocr, self.act_deskew])
         g = r.add_group(p, "出力")
         g.add_stack([self.act_export_text, self.act_export_html, self.act_metadata])
         g = r.add_group(p, "一括")
-        g.add_action(self.act_batch, big=True)
-        g.add_action(self.act_diff, big=True)
+        g.add_stack([self.act_batch, self.act_diff])
         r.end_page(p)
 
         # ── 保護 ────────────────────────────────────────────────
         p = r.add_page("保護")
         g = r.add_group(p, "セキュリティ")
-        g.add_action(self.act_protect, big=True)
-        g.add_action(self.act_unlock, big=True)
+        g.add_stack([self.act_protect, self.act_unlock])
         g = r.add_group(p, "最適化")
-        g.add_action(self.act_compress, big=True)
-        g.add_action(self.act_export_pdfa, big=True)
+        g.add_stack([self.act_compress, self.act_export_pdfa])
         r.end_page(p)
 
         # ── 表示 ────────────────────────────────────────────────
         p = r.add_page("表示")
         g = r.add_group(p, "テーマ")
-        g.add_action(self.act_dark, big=True)
-        g.add_action(self.act_facing, big=True)
+        g.add_stack([self.act_dark, self.act_facing])
         g = r.add_group(p, "パネル")
-        g.add_stack([self.act_toggle_pagedock, self.toc_dock.toggleViewAction()])
+        toc_toggle = self.toc_dock.toggleViewAction()
+        toc_toggle.setIconText("しおり一覧")
+        g.add_stack([self.act_toggle_pagedock, toc_toggle])
         g = r.add_group(p, "しおり")
         g.add_stack([self.act_add_bookmark, self.act_edit_toc])
         g = r.add_group(p, "ヘルプ")
@@ -586,6 +617,19 @@ class MainWindow(QMainWindow):
         r.setStyleSheet(RIBBON_QSS)
         for tb in (self.main_toolbar, self.annot_toolbar, self.search_toolbar):
             tb.hide()
+        # 折りたたみ状態を復元
+        if self.settings.value("ribbon_collapsed", False, bool):
+            r.set_collapsed(True)
+
+    def _jump_to_page_edit(self) -> None:
+        """リボンのページ番号欄からジャンプ（入力 + Enter）。"""
+        try:
+            n = int(self.page_edit.text())
+        except ValueError:
+            return
+        if self.doc.is_open:
+            self._goto(n - 1)  # set_page 側で範囲内に丸められる
+        self.page_view.setFocus()
 
     def _apply_lite_mode(self) -> None:
         """ライト版では OCR・傾き補正（numpy/Pillow 依存）の機能を隠す。"""
@@ -1704,6 +1748,8 @@ class MainWindow(QMainWindow):
         self.settings.setValue("compact", self.act_compact.isChecked())
         self.settings.setValue("annot_bar", self.annot_toolbar.isVisible())
         self.settings.setValue("search_bar", self.search_toolbar.isVisible())
+        if hasattr(self, "ribbon"):
+            self.settings.setValue("ribbon_collapsed", self.ribbon.is_collapsed())
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802
         if event.mimeData().hasUrls() and any(
@@ -2286,6 +2332,17 @@ class MainWindow(QMainWindow):
             )
         else:
             self.page_label.setText("  ページ: - / -  ")
+        # リボンのページ番号欄も同期（リボン構築前に呼ばれることがあるためガード）
+        if hasattr(self, "page_edit"):
+            if self.doc.is_open:
+                if not self.page_edit.hasFocus():  # 入力中は上書きしない
+                    self.page_edit.setText(str(self.page_view.index + 1))
+                self.page_total_label.setText(f" / {self.doc.page_count}")
+                self.page_edit.setEnabled(True)
+            else:
+                self.page_edit.clear()
+                self.page_total_label.setText(" / -")
+                self.page_edit.setEnabled(False)
 
     def _update_title(self) -> None:
         tab = self._active_tab()
