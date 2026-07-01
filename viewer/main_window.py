@@ -1004,6 +1004,15 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         tab.page_view.fit_width()
         self._add_recent(path)
+        # 入力欄付き（フォーム）PDF は Adobe と同様、開いた時点で入力可能にする
+        if doc.is_form():
+            tab.page_view.set_form_mode(True)
+            self.act_form.blockSignals(True)
+            self.act_form.setChecked(True)
+            self.act_form.blockSignals(False)
+            self.statusBar().showMessage(
+                "入力欄のある PDF です。欄をクリックしてそのまま入力できます"
+                "（リボン「ページ > フォーム入力」でオフ）", 6000)
 
     def activate_and_open(self, path: str) -> None:
         """別インスタンスから渡されたパスを開き、ウィンドウを前面化する。"""

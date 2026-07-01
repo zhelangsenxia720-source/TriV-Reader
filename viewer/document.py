@@ -514,13 +514,20 @@ class PdfDocument:
         page = self._doc.load_page(index)
         out = []
         for w in (page.widgets() or []):
+            # choice_values は文字列のほか (エクスポート値, 表示名) のタプルのことがある
+            choices = []
+            for c in (getattr(w, "choice_values", None) or []):
+                if isinstance(c, (list, tuple)):
+                    choices.append(str(c[1] if len(c) > 1 else c[0]))
+                else:
+                    choices.append(str(c))
             out.append({
                 "xref": w.xref,
                 "name": w.field_name or "",
                 "kind": self._widget_kind(w.field_type),
                 "value": w.field_value if w.field_value is not None else "",
                 "rect": w.rect,
-                "choices": list(w.choice_values) if getattr(w, "choice_values", None) else [],
+                "choices": choices,
                 "maxlen": int(getattr(w, "text_maxlen", 0) or 0),
             })
         return out

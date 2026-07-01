@@ -840,10 +840,15 @@ class PageView(QScrollArea):
             ctl.editingFinished.connect(
                 lambda i=index, x=xref, c=ctl: self._commit_field(i, x, c.text()))
         ctl.setGeometry(int(x0), int(y0), w, h)
+        # 文字サイズを欄の高さ（＝ズーム）に追従させる
+        f = ctl.font()
+        f.setPixelSize(max(10, min(int(h * 0.55), 28)))
+        ctl.setFont(f)
+        # Adobe 風の薄青ハイライト
         ctl.setStyleSheet(
-            "QLineEdit, QComboBox { background: rgba(255,247,170,160);"
-            " border: 1px solid #d0a000; padding: 0px 2px; }"
-            "QCheckBox { background: rgba(255,247,170,160); }")
+            "QLineEdit, QComboBox { background: rgba(204,221,255,150);"
+            " border: 1px solid #7096d8; padding: 0px 2px; color: #111; }"
+            "QCheckBox { background: rgba(204,221,255,150); }")
         ctl.show()
         return ctl
 
