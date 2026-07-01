@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen
+from PySide6.QtGui import QColor, QCursor, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import (
     QGridLayout,
     QLabel,
@@ -98,6 +98,16 @@ class _PageLabel(QLabel):
 
     # --- マウス ---------------------------------------------------------
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        # 中クリック: ブラウザ風オートスクロールの開始/停止（ページ上でも効くように）
+        if self._view._auto_active:
+            self._view._stop_autoscroll()
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.MiddleButton:
+            vp = self._view.viewport().mapFromGlobal(event.globalPosition().toPoint())
+            self._view._start_autoscroll(vp)
+            event.accept()
+            return
         tool = self._view.tool
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
@@ -802,35 +812,25 @@ class PageView(QScrollArea):
                 if event.button() == Qt.MouseButton.MiddleButton:
                     self._start_autoscroll(event.position().toPoint())
                     return True
-            elif et == QEvent.Type.MouseMove and self._auto_active:
-                self._auto_pos = event.position().toPoint()
-                if (self._auto_pos - self._auto_origin).manhattanLength() > 10:
-                    self._auto_moved = True
-                return True
-            elif et == QEvent.Type.MouseButtonRelease and self._auto_active:
-                # 押したまま動かした場合は離して停止（クリックだけなら継続）
-                if event.button() == Qt.MouseButton.MiddleButton and self._auto_moved:
-                    self._stop_autoscroll()
-                    return True
         return super().eventFilter(obj, event)
 
     def _start_autoscroll(self, pos: QPoint) -> None:
+        # pos はビューポート座標。以後の移動量はカーソル位置(QCursor)で判定するので
+        # ラベルがビューポートを覆っていても確実に動く。
         self._auto_active = True
         self._auto_origin = pos
-        self._auto_pos = pos
-        self._auto_moved = False
-        self.viewport().setMouseTracking(True)
         self.viewport().setCursor(Qt.CursorShape.SizeVerCursor)
         self._auto_timer.start()
 
     def _stop_autoscroll(self) -> None:
         self._auto_active = False
         self._auto_timer.stop()
-        self.viewport().setMouseTracking(False)
         self.viewport().unsetCursor()
 
     def _auto_scroll_tick(self) -> None:
-        dy = self._auto_pos.y() - self._auto_origin.y()
+        # 現在のカーソル位置（ビューポート基準）と開始点の差でスクロール速度を決める
+        pos = self.viewport().mapFromGlobal(QCursor.pos())
+        dy = pos.y() - self._auto_origin.y()
         if abs(dy) <= self.AUTO_DEADZONE:
             return
         # デッドゾーンを越えた分だけ、距離に比例した速度でスクロール
