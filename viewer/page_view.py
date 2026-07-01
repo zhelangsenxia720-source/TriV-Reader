@@ -9,6 +9,7 @@ from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
+    QFontMetrics,
     QKeySequence,
     QPainter,
     QPen,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QLayout,
     QLineEdit,
     QMenu,
+    QPlainTextEdit,
     QScrollArea,
     QWidget,
 )
@@ -30,6 +32,16 @@ from PySide6.QtWidgets import (
 from .document import PdfDocument
 
 PAGE_SPACING = 12  # ページ間の余白(px)
+
+
+class _FormTextArea(QPlainTextEdit):
+    """複数行フォーム欄。フォーカスが外れたら committed を発火する。"""
+
+    committed = Signal()
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        super().focusOutEvent(event)
+        self.committed.emit()
 
 # 注釈ツール
 TOOL_NONE = "none"
@@ -832,6 +844,14 @@ class PageView(QScrollArea):
             ctl.setCurrentText(str(value))
             ctl.currentTextChanged.connect(
                 lambda text, i=index, x=xref: self._commit_field(i, x, text))
+        elif field.get("multiline"):  # 複数行のテキスト欄
+            ctl = _FormTextArea(label)
+            ctl.setPlainText(str(value))
+            ctl.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            ctl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            ctl.committed.connect(
+                lambda i=index, x=xref, c=ctl: self._commit_field(
+                    i, x, c.toPlainText()))
         else:  # text / radio / その他 → テキスト入力
             ctl = QLineEdit(label)
             ctl.setText(str(value))
@@ -840,15 +860,50 @@ class PageView(QScrollArea):
             ctl.editingFinished.connect(
                 lambda i=index, x=xref, c=ctl: self._commit_field(i, x, c.text()))
         ctl.setGeometry(int(x0), int(y0), w, h)
-        # 文字サイズを欄の高さ（＝ズーム）に追従させる
+
+        # --- 文字サイズ: PDF 指定サイズ（pt）を尊重。0 は自動（枠に収める） ---
+        pdf_fs = float(field.get("fontsize", 0) or 0)
+        if pdf_fs > 0:
+            base_px = max(8, int(pdf_fs * self._zoom))
+        else:
+            base_px = max(10, min(int(h * 0.55), 28))
         f = ctl.font()
-        f.setPixelSize(max(10, min(int(h * 0.55), 28)))
-        ctl.setFont(f)
-        # Adobe 風の薄青ハイライト
-        ctl.setStyleSheet(
-            "QLineEdit, QComboBox { background: rgba(204,221,255,150);"
-            " border: 1px solid #7096d8; padding: 0px 2px; color: #111; }"
-            "QCheckBox { background: rgba(204,221,255,150); }")
+        f.setPixelSize(base_px)
+
+        if field.get("comb") and field.get("maxlen"):
+            # コム欄: 1文字ずつマス目に均等配置（字間で再現）
+            cell = w / field["maxlen"]
+            fm = QFontMetrics(f)
+            spacing = max(0.0, cell - fm.averageCharWidth())
+            f.setLetterSpacing(f.SpacingType.AbsoluteSpacing, spacing)
+            ctl.setFont(f)
+            pad_left = max(0, int((cell - fm.averageCharWidth()) / 2))
+            ctl.setStyleSheet(
+                "QLineEdit { background: rgba(204,221,255,150);"
+                " border: 1px solid #7096d8;"
+                f" padding: 0px 0px 0px {pad_left}px; color: #111; }}")
+        else:
+            ctl.setFont(f)
+            # Adobe 風の薄青ハイライト
+            ctl.setStyleSheet(
+                "QLineEdit, QComboBox, QPlainTextEdit {"
+                " background: rgba(204,221,255,150);"
+                " border: 1px solid #7096d8; padding: 0px 2px; color: #111; }"
+                "QCheckBox { background: rgba(204,221,255,150); }")
+            # 自動サイズの1行欄: 入力に応じて縮小し、枠からはみ出さない（Adobe同等）
+            if pdf_fs == 0 and isinstance(ctl, QLineEdit):
+                def _fit_font(text, c=ctl, base=base_px):
+                    fnt = c.font()
+                    size = base
+                    avail = max(10, c.width() - 8)
+                    while size > 7:
+                        fnt.setPixelSize(size)
+                        if QFontMetrics(fnt).horizontalAdvance(text) <= avail:
+                            break
+                        size -= 1
+                    c.setFont(fnt)
+                ctl.textChanged.connect(_fit_font)
+                _fit_font(ctl.text())
         ctl.show()
         return ctl
 

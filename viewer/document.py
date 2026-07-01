@@ -511,6 +511,8 @@ class PdfDocument:
         """指定ページのフォーム欄一覧。各要素は dict（rect は fitz.Rect）。"""
         if not self._doc:
             return []
+        COMB = 1 << 24       # 1文字ずつマス目に入れる欄
+        MULTILINE = 1 << 12  # 複数行欄
         page = self._doc.load_page(index)
         out = []
         for w in (page.widgets() or []):
@@ -521,6 +523,9 @@ class PdfDocument:
                     choices.append(str(c[1] if len(c) > 1 else c[0]))
                 else:
                     choices.append(str(c))
+            is_text = w.field_type == fitz.PDF_WIDGET_TYPE_TEXT
+            maxlen = int(getattr(w, "text_maxlen", 0) or 0)
+            flags = int(getattr(w, "field_flags", 0) or 0)
             out.append({
                 "xref": w.xref,
                 "name": w.field_name or "",
@@ -528,7 +533,11 @@ class PdfDocument:
                 "value": w.field_value if w.field_value is not None else "",
                 "rect": w.rect,
                 "choices": choices,
-                "maxlen": int(getattr(w, "text_maxlen", 0) or 0),
+                "maxlen": maxlen,
+                "comb": bool(is_text and maxlen and (flags & COMB)),
+                "multiline": bool(is_text and (flags & MULTILINE)),
+                # 0 は「自動（枠に合わせて縮小）」の意味（Adobe と同じ）
+                "fontsize": float(getattr(w, "text_fontsize", 0) or 0),
             })
         return out
 
