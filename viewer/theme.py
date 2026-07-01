@@ -74,7 +74,7 @@ def _qss(c: dict) -> str:
         border-radius: 6px; padding: 4px 7px; color: {c['text']}; selection-background-color: {c['accent']}; }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border: 1px solid {c['accent']}; }}
     QComboBox::drop-down {{ border: 0; width: 18px; }}
-    QDockWidget {{ color: {c['text']}; titlebar-close-icon: none; }}
+    QDockWidget {{ color: {c['text']}; }}
     QDockWidget::title {{ background: {c['toolbar']}; padding: 7px 10px;
         border-bottom: 1px solid {c['border']}; }}
     QListWidget, QTreeWidget {{ background: {c['base']}; color: {c['text']};
