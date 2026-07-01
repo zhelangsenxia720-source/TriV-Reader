@@ -142,6 +142,7 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         self._tray_notified = False
         self._setup_tray()
+        self._build_ribbon()  # Foxit 風リボンを最上部に（従来のバーは隠す）
 
     # --- アクティブタブへのアクセス（プロパティ） ---------------------
     def _active_tab(self) -> "DocTab | None":
@@ -475,6 +476,116 @@ class MainWindow(QMainWindow):
         m_help.addAction(self.act_set_update_url)
         m_help.addSeparator()
         m_help.addAction(self.act_about)
+
+    def _build_ribbon(self) -> None:
+        """Foxit 風のリボン（タブ切替式ツールバー）を最上部に構築する。
+
+        既存の QAction / ウィジェットをそのまま流用し、従来のメニューバー・
+        ツールバーは隠す。ボタンは action に束ねるので状態は自動同期する。
+        """
+        from PySide6.QtWidgets import QToolButton
+
+        from .ribbon import RIBBON_QSS, Ribbon
+
+        r = Ribbon(self)
+        self.ribbon = r
+
+        # ── ホーム ──────────────────────────────────────────────
+        p = r.add_page("ホーム")
+        g = r.add_group(p, "ファイル")
+        g.add_action(self.act_open, big=True)
+        recent_btn = QToolButton()
+        recent_btn.setText("最近使用 ▾")
+        recent_btn.setAutoRaise(True)
+        recent_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        recent_btn.setMenu(self.recent_menu)
+        g.add_widget(recent_btn)
+        g.add_stack([self.act_save, self.act_save_as, self.act_print])
+        g = r.add_group(p, "ページ移動")
+        g.add_action(self.act_prev, big=True)
+        g.add_action(self.act_next, big=True)
+        g = r.add_group(p, "表示倍率")
+        g.add_stack([self.act_zoom_in, self.act_zoom_out, self.act_fit])
+        g.add_widget(self.zoom_slider)
+        g.add_widget(self.zoom_combo)
+        g = r.add_group(p, "回転")
+        g.add_action(self.act_rotate_left, big=True)
+        g.add_action(self.act_rotate_right, big=True)
+        g = r.add_group(p, "検索")
+        g.add_widget(self.search_edit)
+        g.add_action(self.act_search_prev)
+        g.add_action(self.act_search_next)
+        g.add_widget(self.search_count_label)
+        g.add_action(self.act_highlight_all)
+        r.end_page(p)
+
+        # ── 注釈 ────────────────────────────────────────────────
+        p = r.add_page("注釈")
+        g = r.add_group(p, "ツール")
+        g.add_stack(list(self.tool_group.actions()))
+        g = r.add_group(p, "書式")
+        g.add_action(self.act_color, big=True)
+        g.add_label(" 太さ ")
+        g.add_widget(self.width_spin)
+        g = r.add_group(p, "編集")
+        g.add_stack([self.act_apply_redact, self.act_clear_annots, self.act_copy])
+        r.end_page(p)
+
+        # ── ページ ──────────────────────────────────────────────
+        p = r.add_page("ページ")
+        g = r.add_group(p, "モード")
+        g.add_action(self.act_organize, big=True)
+        g.add_action(self.act_form, big=True)
+        g = r.add_group(p, "ページ操作")
+        g.add_stack([self.act_delete, self.act_merge, self.act_extract, self.act_split])
+        g = r.add_group(p, "挿入・調整")
+        g.add_stack([self.act_blank_page, self.act_duplicate_page, self.act_autocrop])
+        g = r.add_group(p, "装飾")
+        g.add_stack([self.act_page_numbers, self.act_header_footer, self.act_watermark])
+        r.end_page(p)
+
+        # ── 変換 ────────────────────────────────────────────────
+        p = r.add_page("変換")
+        g = r.add_group(p, "画像")
+        g.add_stack([self.act_to_images, self.act_from_images, self.act_add_images])
+        g = r.add_group(p, "文字認識")
+        g.add_action(self.act_ocr, big=True)
+        g.add_action(self.act_deskew, big=True)
+        g = r.add_group(p, "出力")
+        g.add_stack([self.act_export_text, self.act_export_html, self.act_metadata])
+        g = r.add_group(p, "一括")
+        g.add_action(self.act_batch, big=True)
+        g.add_action(self.act_diff, big=True)
+        r.end_page(p)
+
+        # ── 保護 ────────────────────────────────────────────────
+        p = r.add_page("保護")
+        g = r.add_group(p, "セキュリティ")
+        g.add_action(self.act_protect, big=True)
+        g.add_action(self.act_unlock, big=True)
+        g = r.add_group(p, "最適化")
+        g.add_action(self.act_compress, big=True)
+        g.add_action(self.act_export_pdfa, big=True)
+        r.end_page(p)
+
+        # ── 表示 ────────────────────────────────────────────────
+        p = r.add_page("表示")
+        g = r.add_group(p, "テーマ")
+        g.add_action(self.act_dark, big=True)
+        g.add_action(self.act_facing, big=True)
+        g = r.add_group(p, "パネル")
+        g.add_stack([self.act_toggle_pagedock, self.toc_dock.toggleViewAction()])
+        g = r.add_group(p, "しおり")
+        g.add_stack([self.act_add_bookmark, self.act_edit_toc])
+        g = r.add_group(p, "ヘルプ")
+        g.add_stack([self.act_check_update, self.act_set_update_url, self.act_about])
+        r.end_page(p)
+
+        # リボンを最上部に据え、従来のメニューバー/ツールバーは隠す
+        self.setMenuWidget(r)
+        r.setStyleSheet(RIBBON_QSS)
+        for tb in (self.main_toolbar, self.annot_toolbar, self.search_toolbar):
+            tb.hide()
 
     def _apply_lite_mode(self) -> None:
         """ライト版では OCR・傾き補正（numpy/Pillow 依存）の機能を隠す。"""
